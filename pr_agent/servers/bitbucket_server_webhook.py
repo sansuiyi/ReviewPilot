@@ -1,0 +1,290 @@
+import ast
+import copy
+import os
+from typing import List
+
+import uvicorn
+from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import RedirectResponse
+from starlette import status
+from starlette.background import BackgroundTasks
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette_context import context
+from starlette_context.middleware import RawContextMiddleware
+
+from pr_agent.agent.pr_agent import PRAgent, prepare_command
+from pr_agent.agent.request_policy import RequestOutcome
+from pr_agent.config_loader import get_settings, global_settings
+from pr_agent.git_providers.utils import apply_repo_settings
+from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import (
+    get_pr_commands,
+    is_command_comment,
+    payload_log_summary,
+    push_trigger_slot,
+    shared_should_process_pr_logic,
+    verify_signature,
+)
+
+setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
+router = APIRouter()
+
+
+def handle_request(
+    background_tasks: BackgroundTasks, url: str, body: str, log_context: dict
+):
+    log_context["action"] = body
+    log_context["api_url"] = url
+
+    async def inner():
+        try:
+            with get_logger().contextualize(**log_context):
+                if await PRAgent().handle_request(url, body) is RequestOutcome.SKIPPED:
+                    return RequestOutcome.SKIPPED
+        except Exception as e:
+            get_logger().error(f"Failed to handle webhook: {e}")
+
+    background_tasks.add_task(inner)
+
+def should_process_pr_logic(data) -> bool:
+    try:
+        if not shared_should_process_pr_logic(data, provider="bitbucket_server", raise_on_error=True):
+            return False
+    except Exception:
+        # Preserve fail-open fallback without continuing into folder filtering on error
+        return True
+
+    try:
+        # Filter by allowed folders if configured
+        allowed_folders = get_settings().config.get("allow_only_specific_folders", [])
+        if allowed_folders:
+            pr_data = data.get("pullRequest", {})
+            pr_id = pr_data.get("id", None)
+            to_ref = pr_data.get("toRef", {}) if pr_data else {}
+            repository = to_ref.get("repository", {}) if to_ref else {}
+            project = repository.get("project", {}) if repository else {}
+            project_key = project.get("key", "") if project else ""
+            repo_slug = repository.get("slug", "") if repository else ""
+
+            if pr_id and project_key and repo_slug:
+                from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
+
+                bitbucket_server_url = get_settings().get("BITBUCKET_SERVER.URL", "")
+                pr_url = f"{bitbucket_server_url}/projects/{project_key}/repos/{repo_slug}/pull-requests/{pr_id}"
+                provider = BitbucketServerProvider(pr_url=pr_url)
+                changed_files = provider.get_files()
+                if changed_files:
+                    # Check if ALL files are outside allowed folders
+                    all_files_outside = True
+                    for file_path in changed_files:
+                        if any(file_path.startswith(folder) for folder in allowed_folders):
+                            all_files_outside = False
+                            break
+
+                    if all_files_outside:
+                        get_logger().info(
+                            f"Ignoring PR because all files {changed_files} are outside "
+                            f"allowed folders {allowed_folders}"
+                        )
+                        return False
+    except Exception as e:
+        get_logger().error(f"Failed 'should_process_pr_logic': {e}")
+        return True
+    return True
+
+@router.post("/")
+async def redirect_to_webhook():
+    return RedirectResponse(url="/webhook")
+
+@router.post("/webhook")
+async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
+    log_context = {"server_type": "bitbucket_server"}
+    webhook_secret = get_settings().get("BITBUCKET_SERVER.WEBHOOK_SECRET", None)
+    if not webhook_secret:
+        get_logger().error("Rejecting Bitbucket Server webhook: BITBUCKET_SERVER.WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=403, detail="Webhook authentication is not configured.")
+
+    body_bytes = await request.body()
+    if body_bytes.decode('utf-8') == '{"test": true}':
+        return JSONResponse(
+            status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "connection test successful"})
+        )
+    signature_header = request.headers.get("x-hub-signature", None)
+    verify_signature(body_bytes, webhook_secret, signature_header)
+    data = await request.json()
+    get_logger().info(payload_log_summary(data, ("eventKey",)))
+
+    # Install a per-request settings clone only after auth/connection-test checks, so
+    # rejected traffic doesn't pay the deepcopy cost. Must precede apply_repo_settings(),
+    # which mutates get_settings() (context["settings"] when present).
+    context["settings"] = copy.deepcopy(global_settings)
+
+    # Repository pushes such as "repo:refs_changed" carry no "pullRequest" key, so read it
+    # defensively instead of raising KeyError and turning every push into an HTTP 500.
+    pull_request = data.get("pullRequest") or {}
+    to_ref = pull_request.get("toRef") or {}
+    repository = to_ref.get("repository") or {}
+    pr_id = pull_request.get("id")
+    repository_name = repository.get("slug", "")
+    project_name = (repository.get("project") or {}).get("key", "")
+    if pr_id in (None, -1):
+        get_logger().info(f"Ignoring event without a pull request: {data.get('eventKey')}", **log_context)
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=jsonable_encoder({"message": "Ignored event without a pull request"}),
+        )
+
+    bitbucket_server = get_settings().get("BITBUCKET_SERVER.URL")
+    pr_url = f"{bitbucket_server}/projects/{project_name}/repos/{repository_name}/pull-requests/{pr_id}"
+
+    log_context["api_url"] = pr_url
+    log_context["event"] = "pull_request"
+
+    commands_to_run = []
+    is_push_event = False
+
+    # push events without a pull request are already ignored above
+    if (data["eventKey"] == "pr:opened"
+            or data["eventKey"] in ["pr:from_ref_updated", "repo:refs_changed"]):
+        apply_repo_settings(pr_url)
+        if not should_process_pr_logic(data):
+            get_logger().info("PR ignored due to config settings", **log_context)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "PR ignored by config"})
+            )
+        if get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+            get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {pr_url}", **log_context)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=jsonable_encoder({"message": "PR ignored due to auto feedback not enabled"})
+            )
+        get_settings().set("config.is_auto_command", True)
+        if data["eventKey"] == "pr:opened":
+            commands_to_run.extend(get_pr_commands("bitbucket_server"))
+        else: # Has to be: data["eventKey"] == "pr:from_ref_updated" or "repo:refs_changed"
+            if not get_settings().get("BITBUCKET_SERVER.HANDLE_PUSH_TRIGGER"):
+                get_logger().info(f"Push trigger is disabled, skipping push commands for PR {pr_url}", **log_context)
+                return JSONResponse(
+                    status_code=status.HTTP_200_OK,
+                    content=jsonable_encoder({"message": "PR ignored due to push trigger not enabled"})
+                )
+
+            get_settings().set("config.is_new_pr", False)
+            commands_to_run.extend(_get_commands_list_from_settings('BITBUCKET_SERVER.PUSH_COMMANDS'))
+            is_push_event = True
+    elif data["eventKey"] == "pr:comment:added":
+        comment_text = data["comment"]["text"]
+        if not is_command_comment(comment_text):
+            # A plain comment whose first word happens to be a command name must not
+            # dispatch a tool: the dispatcher strips an optional leading slash.
+            get_logger().info("Ignoring comment not starting with /")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=jsonable_encoder({"message": "Comment ignored - not a command"}),
+            )
+        commands_to_run.append(comment_text)
+    else:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=jsonable_encoder({"message": "Unsupported event"}),
+        )
+
+    async def inner():
+        try:
+            if is_push_event:
+                async with push_trigger_slot(pr_url, allow_backlog=True, ttl=300) as proceed:
+                    if proceed:
+                        await _run_commands_sequentially(commands_to_run, pr_url, log_context)
+            else:
+                await _run_commands_sequentially(commands_to_run, pr_url, log_context)
+        except Exception as e:
+            get_logger().error(f"Failed to handle webhook: {e}")
+
+    background_tasks.add_task(inner)
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"})
+    )
+
+
+async def _run_commands_sequentially(commands: List[str], url: str, log_context: dict):
+    get_logger().info(f"Running commands sequentially: {commands}")
+    if commands is None:
+        return
+
+    for command in commands:
+        try:
+            body = _process_command(command, url)
+
+            log_context["action"] = body
+            log_context["api_url"] = url
+
+            with get_logger().contextualize(**log_context):
+                if await PRAgent().handle_request(url, body) is RequestOutcome.SKIPPED:
+                    return RequestOutcome.SKIPPED
+        except Exception as e:
+            get_logger().error(f"Failed to handle command: {command} , error: {e}")
+
+def _process_command(command: str, url) -> list[str]:
+    # don't think we need this
+    apply_repo_settings(url)
+    return prepare_command(command)
+
+
+def _to_list(command_string: str) -> list:
+    try:
+        # Use ast.literal_eval to safely parse the string into a list
+        commands = ast.literal_eval(command_string)
+        # Check if the parsed object is a list of strings
+        if isinstance(commands, list) and all(isinstance(cmd, str) for cmd in commands):
+            return commands
+        else:
+            raise ValueError("Parsed data is not a list of strings.")
+    except (SyntaxError, ValueError, TypeError) as e:
+        raise ValueError(f"Invalid command string: {e}") from e
+
+
+def _get_commands_list_from_settings(setting_key: str) -> list:
+    try:
+        return get_settings().get(setting_key, [])
+    except ValueError as e:
+        get_logger().error(f"Failed to get commands list from settings {setting_key}: {e}")
+        return []
+
+
+@router.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+app = create_server_app(middleware=[Middleware(RawContextMiddleware)])
+app.include_router(router)
+
+
+def start():
+    """
+    Start the BitBucket Webhook server.
+
+    The server port can be configured via the PORT environment variable.
+    Defaults to 3000 if PORT is not set or invalid.
+    """
+
+    raw_port = os.environ.get("PORT")
+    try:
+        port = int(raw_port) if raw_port else 3000
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port {port} is out of valid range")
+        if raw_port:
+            get_logger().info(f"Using custom PORT from environment: {port}")
+    except ValueError as e:
+        get_logger().warning(f"Invalid PORT environment variable ({e}), using default port 3000")
+        port = 3000
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    start()

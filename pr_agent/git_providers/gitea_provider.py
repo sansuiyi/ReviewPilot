@@ -1,0 +1,1317 @@
+import functools
+import json
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote, urlparse
+
+import giteapy
+from giteapy.rest import ApiException
+
+from pr_agent.agent.request_policy import policy_metadata, policy_value
+from pr_agent.algo.file_filter import filter_ignored
+from pr_agent.algo.git_patch_processing import decode_if_bytes
+from pr_agent.algo.language_handler import is_valid_file
+from pr_agent.algo.token_budget import clip_tokens
+from pr_agent.algo.types import EDIT_TYPE
+from pr_agent.algo.utils import find_line_number_of_relevant_line_in_file
+from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    FilePatchInfo,
+    GitProvider,
+    IncompleteProviderPullRequestFilesError,
+    IncrementalPR,
+    cache_languages,
+    redact_credentials,
+)
+from pr_agent.git_providers.request_timeout import get_http_request_timeout
+from pr_agent.log import get_logger
+from pr_agent.mosaico.diff_provider import parse_unified_diff
+
+# Shipped default for the [gitea] url setting in configuration.toml. A value
+# equal to this must be treated as "unset" when resolving the user-facing base
+# URL: the default is always present in production, so a bare truthiness check
+# on GITEA.URL would make the pr.html_url derivation unreachable.
+DEFAULT_GITEA_URL = "https://gitea.com"
+
+
+class IncompleteGiteaPullRequestFilesError(IncompleteProviderPullRequestFilesError):
+    """Represent an unavailable or malformed Gitea changed-file inventory."""
+
+    notice = (
+        "## PR-Agent command was not run\n\n"
+        "Gitea returned incomplete or unavailable pull-request change data, so PR-Agent stopped "
+        "instead of analyzing only part of it.\n\n"
+        "Retry the command and check the pull request's changed files and diff in Gitea if the problem persists."
+    )
+    notice_marker = "<!-- pr-agent:gitea-incomplete-files -->"
+
+
+class _GiteaCommitAdapter:
+    """Mimics PyGithub `Commit` shape (.sha, .html_url) over a raw Gitea commit payload."""
+
+    def __init__(self, raw: Dict[str, Any]):
+        raw = raw or {}
+        self.sha = raw.get("sha", "")
+        self.html_url = raw.get("html_url", "")
+
+
+def _with_default_request_timeout(call_api):
+    """Fill in connect/read bounds when giteapy forwards an unset request timeout."""
+    @functools.wraps(call_api)
+    def call_api_with_timeout(*args, **kwargs):
+        if not kwargs.get("_request_timeout"):
+            kwargs["_request_timeout"] = (get_http_request_timeout(),) * 2
+        return call_api(*args, **kwargs)
+
+    return call_api_with_timeout
+
+
+class GiteaProvider(GitProvider):
+    def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
+        pr = self.pr
+        if pr is None:
+            return policy_metadata(title="", sender="", repo_full_name=f"{self.owner}/{self.repo}",
+                                   source_branch="", target_branch="")
+        return policy_metadata(title=pr.title, sender=policy_value(pr, "user", "login"),
+                               repo_full_name=f"{self.owner}/{self.repo}",
+                               source_branch=policy_value(pr, "head", "ref"),
+                               target_branch=policy_value(pr, "base", "ref"),
+                               labels=self.get_pr_labels() if "labels" in required_fields else ())
+
+    _base_url_html: Optional[str] = None  # resolved on first use, see base_url_html
+
+    def __init__(self, url: Optional[str] = None):
+        super().__init__()
+        self.logger = get_logger()
+
+        if not url:
+            self.logger.error("PR URL not provided.")
+            raise ValueError("PR URL not provided.")
+
+        self.base_url = get_settings().get("GITEA.URL", DEFAULT_GITEA_URL).rstrip("/")
+        self.pr_url = ""
+        self.issue_url = ""
+
+        self.gitea_access_token = get_settings().get("GITEA.PERSONAL_ACCESS_TOKEN", None)
+        if not self.gitea_access_token:
+            self.logger.error("Gitea access token not found in settings.")
+            raise ValueError("Gitea access token not found in settings.")
+
+        self.repo_settings = get_settings().get("GITEA.REPO_SETTING", None)
+        configuration = giteapy.Configuration()
+        configuration.host = "{}/api/v1".format(self.base_url)
+        configuration.api_key['Authorization'] = f'token {self.gitea_access_token}'
+
+        if get_settings().get("GITEA.SKIP_SSL_VERIFICATION", False):
+            configuration.verify_ssl = False
+
+        # Use custom cert (self-signed)
+        configuration.ssl_ca_cert = get_settings().get("GITEA.SSL_CA_CERT", None)
+
+        client = giteapy.ApiClient(configuration)
+        client.call_api = _with_default_request_timeout(client.call_api)
+        self.repo_api = RepoApi(client)
+        self.owner = None
+        self.repo = None
+        self.pr_number = None
+        self.issue_number = None
+        self.max_comment_chars = 65000
+        self.enabled_pr = False
+        self.enabled_issue = False
+        self.temp_comments = []
+        self.pr = None
+        self.git_files = None
+        self.file_contents = {}
+        self.file_diffs = {}
+        self.sha = None
+        self.base_sha = ""
+        self.base_ref = ""
+        self.diff_files = None
+        self.incremental = IncrementalPR(False)
+        self.comments_list = []
+        self.unreviewed_files_map = dict()
+
+        if "pulls" in url:
+            self.pr_url = url
+            self.__set_repo_and_owner_from_pr()
+            self.enabled_pr = True
+            self.pr = self.repo_api.get_pull_request(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number
+            )
+            self.sha = self.pr.head.sha if self.pr.head.sha else ""
+            self.__add_file_diff()
+            self._set_pr_commits()
+            self.base_sha = self.pr.base.sha if self.pr.base.sha else ""
+            self.base_ref = self.pr.base.ref if self.pr.base.ref else ""
+        elif "issues" in url:
+            self.issue_url = url
+            self.__set_repo_and_owner_from_issue()
+            self.enabled_issue = True
+        else:
+            self.pr_commits = None
+
+    @property
+    def base_url_html(self) -> str:
+        """User-facing base URL, resolved on first use rather than in the constructor:
+        apply_repo_settings builds the provider before it merges the repo's .pr_agent.toml,
+        so resolving here is what lets a repo-level `gitea.web_url` take effect."""
+        if self._base_url_html is None:
+            self._base_url_html = self._resolve_base_url_html()
+        return self._base_url_html
+
+    @base_url_html.setter
+    def base_url_html(self, value: str) -> None:
+        self._base_url_html = value
+
+    def _resolve_base_url_html(self) -> str:
+        """User-facing base URL interpolated into links published in comments.
+
+        ``base_url`` is where PR-Agent reaches the API, which may be an internal
+        address (Docker service name, cluster DNS) that users cannot browse, so
+        generated links must not be built from it. Resolution order:
+
+        1. The optional ``GITEA.WEB_URL`` setting.
+        2. An explicitly configured ``GITEA.URL``: an operator-set value wins
+           over the server's self-reported ``ROOT_URL``, which ``pr.html_url``
+           is built from and which may still be the default on some instances.
+           The shipped default (``DEFAULT_GITEA_URL``) does not count here -
+           configuration.toml always provides it, so a plain truthiness check
+           would leave the derivation below unreachable.
+        3. Derived from ``pr.html_url``, which Gitea/Forgejo builds from its
+           own external ``ROOT_URL``.
+        4. ``base_url``, so existing single-URL deployments are unaffected.
+        """
+        web_url = (get_settings().get("GITEA.WEB_URL", "") or "").rstrip("/")
+        if web_url:
+            return web_url
+        configured_url = (get_settings().get("GITEA.URL", "") or "").rstrip("/")
+        if configured_url and configured_url != DEFAULT_GITEA_URL:
+            return self.base_url
+        pr_html_url = getattr(self.pr, "html_url", "") if self.pr else ""
+        pr_url_suffix = f"/{self.owner}/{self.repo}/pulls/{self.pr_number}"
+        if pr_html_url and pr_html_url.endswith(pr_url_suffix):
+            return pr_html_url[: -len(pr_url_suffix)]
+        return self.base_url
+
+    def _set_pr_commits(self):
+        """Load the commits of the PR itself, not the commits of the repository's default branch."""
+        raw_commits = self.repo_api.get_pr_commits(
+            owner=self.owner,
+            repo=self.repo,
+            pr_number=self.pr_number
+        ) or []
+        if not isinstance(raw_commits, list):
+            self.logger.error(f"Unexpected PR commits payload type: {type(raw_commits)}")
+            raw_commits = []
+        # Gitea returns PR commits newest-first; oldest-first matches GitHub iteration order.
+        self.pr_commits = [
+            _GiteaCommitAdapter(commit) for commit in reversed(raw_commits) if isinstance(commit, dict)
+        ]
+        if not self.pr_commits:
+            self.logger.error("Failed to get PR commits")
+        # Fall back to a commit wrapping the PR head SHA (rather than None) so callers that
+        # dereference last_commit/last_commit_id (e.g. publish_inline_comments, the description
+        # header) always have a valid .sha, even when the commits endpoint returns nothing.
+        self.last_commit = next(
+            (commit for commit in self.pr_commits if commit.sha and commit.sha == self.sha),
+            self.pr_commits[-1] if self.pr_commits else _GiteaCommitAdapter({"sha": self.sha})
+        )
+        self.last_commit_id = self.last_commit
+
+    def __add_file_content(self, file_path: str):
+        if not is_valid_file(file_path) or file_path in self.file_contents:
+            return
+
+        if file_path and self.sha:
+            try:
+                content = self.repo_api.get_file_content(
+                    owner=self.owner,
+                    repo=self.repo,
+                    commit_sha=self.sha,
+                    filepath=file_path
+                )
+                self.file_contents[file_path] = content
+            except ApiException as e:
+                self.logger.error(f"Error getting file content for {file_path}: {str(e)}")
+                self.file_contents[file_path] = ""
+
+    def __add_file_diff(self):
+        try:
+            diff_contents = self.repo_api.get_pull_request_diff(
+                    owner=self.owner,
+                    repo=self.repo,
+                    pr_number=self.pr_number
+            )
+
+            self.file_diffs = {f.filename: f.patch for f in parse_unified_diff(diff_contents)}
+        except Exception as e:
+            self.logger.error(f"Error getting diff content: {str(e)}")
+
+    @staticmethod
+    def _url_path_parts(url: str) -> list[str]:
+        """Split a PR or issue URL into path parts that start at the owner.
+
+        Strip the install path of the configured ``GITEA.URL`` or ``GITEA.WEB_URL`` first,
+        so an instance served under a subpath (``https://host/gitea/owner/repo/pulls/1``)
+        parses like a root install, then strip the ``/api/v1/repos`` API prefix.
+        """
+        path = urlparse(url).path
+        for base_url in (get_settings().get("GITEA.URL", ""), get_settings().get("GITEA.WEB_URL", "")):
+            base_path = urlparse(base_url or "").path.rstrip("/")
+            if base_path and path.startswith(base_path + "/"):
+                path = path[len(base_path):]
+                break
+        if path.startswith("/api/v1/repos"):
+            path = path[len("/api/v1/repos"):]
+        return path.strip('/').split('/')
+
+    def _parse_pr_url(self, pr_url: str) -> Tuple[str, str, int]:
+        path_parts = self._url_path_parts(pr_url)
+        if len(path_parts) < 4 or path_parts[2] != 'pulls':
+            raise ValueError("The provided URL does not appear to be a Gitea PR URL")
+
+        try:
+            pr_number = int(path_parts[3])
+        except ValueError as e:
+            raise ValueError("Unable to convert PR number to integer") from e
+
+        owner = path_parts[0]
+        repo = path_parts[1]
+
+        return owner, repo, pr_number
+
+    def _parse_issue_url(self, issue_url: str) -> Tuple[str, str, int]:
+        path_parts = self._url_path_parts(issue_url)
+        if len(path_parts) < 4 or path_parts[2] != 'issues':
+            raise ValueError("The provided URL does not appear to be a Gitea issue URL")
+
+        try:
+            issue_number = int(path_parts[3])
+        except ValueError as e:
+            raise ValueError("Unable to convert issue number to integer") from e
+
+        owner = path_parts[0]
+        repo = path_parts[1]
+
+        return owner, repo, issue_number
+
+    def __set_repo_and_owner_from_pr(self):
+        """Extract owner and repo from the PR URL"""
+        try:
+            owner, repo, pr_number = self._parse_pr_url(self.pr_url)
+            self.owner = owner
+            self.repo = repo
+            self.pr_number = pr_number
+            self.logger.info(f"Owner: {self.owner}, Repo: {self.repo}, PR Number: {self.pr_number}")
+        except ValueError as e:
+            self.logger.error(f"Error parsing PR URL: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {str(e)}")
+
+    def __set_repo_and_owner_from_issue(self):
+        """Extract owner and repo from the issue URL"""
+        try:
+            owner, repo, issue_number = self._parse_issue_url(self.issue_url)
+            self.owner = owner
+            self.repo = repo
+            self.issue_number = issue_number
+            self.logger.info(f"Owner: {self.owner}, Repo: {self.repo}, Issue Number: {self.issue_number}")
+        except ValueError as e:
+            self.logger.error(f"Error parsing issue URL: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {str(e)}")
+
+    def get_pr_url(self) -> str:
+        # Gitea sets url and html_url identically on the PR payload (the
+        # user-facing page), and self.pr_url comes from _parse_pr_url, which
+        # rejects the API form - so rebuild the page URL from base_url_html,
+        # letting a configured GITEA.WEB_URL reach the links built from here.
+        # Call sites are user-facing output only (pr_description, pr_reviewer,
+        # pr_update_changelog); API and clone paths use base_url directly.
+        if self.owner and self.repo and self.pr_number:
+            return f"{self.base_url_html}/{self.owner}/{self.repo}/pulls/{self.pr_number}"
+        return self.pr_url
+
+    def get_latest_commit_url(self) -> str:
+        return self.last_commit.html_url if self.last_commit else ""
+
+    def get_pr_head_sha(self) -> str:
+        sha = getattr(self.last_commit, "sha", None)
+        return sha if isinstance(sha, str) else ""
+
+    def get_comment_url(self, comment) -> str:
+        if isinstance(comment, dict):
+            return comment.get("html_url") or comment.get("url") or ""
+        return getattr(comment, "html_url", "") or getattr(comment, "url", "")
+
+    def publish_comment(self, comment: str,is_temporary: bool = False) -> None:
+        """Publish a comment to the pull request"""
+        if is_temporary and not get_settings().config.publish_output_progress:
+            get_logger().debug("Skipping publish_comment for temporary comment")
+            return None
+
+        if self.enabled_issue:
+            index = self.issue_number
+        elif self.enabled_pr:
+            index = self.pr_number
+        else:
+            self.logger.error("Neither PR nor issue URL provided.")
+            return None
+
+        comment = self.limit_output_characters(comment, self.max_comment_chars)
+        response = self.repo_api.create_comment(
+            owner=self.owner,
+            repo=self.repo,
+            index=index,
+            comment=comment
+        )
+
+        if not response:
+            self.logger.error("Failed to publish comment")
+            return None
+
+        if is_temporary:
+            self.temp_comments.append(comment)
+
+        comment_obj = {
+            "is_temporary": is_temporary,
+            "comment": comment,
+            "comment_id": response.id if isinstance(response, tuple) else response.id
+        }
+        self.comments_list.append(comment_obj)
+        self.logger.info("Comment published")
+        return comment_obj
+
+    def edit_comment(self, comment, body : str):
+        body = self.limit_output_characters(body, self.max_comment_chars)
+        if isinstance(comment, dict):
+            comment_id = comment.get("comment_id") or comment.get("id")
+        else:
+            comment_id = getattr(comment, "id", None)
+        try:
+            self.repo_api.edit_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=comment_id,
+                comment=body
+            )
+        except ApiException as e:
+            self.logger.error(f"Error editing comment: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return False
+
+
+    def publish_inline_comment(self,body: str, relevant_file: str, relevant_line_in_file: str,
+                               original_suggestion=None):
+        """Publish an inline comment on a specific line"""
+        body = self.limit_output_characters(body, self.max_comment_chars)
+        position, absolute_position = find_line_number_of_relevant_line_in_file(self.diff_files,
+                                                                                relevant_file.strip('`'),
+                                                                                relevant_line_in_file,
+                                                                                )
+        if position == -1:
+            get_logger().info(f"Could not find position for {relevant_file} {relevant_line_in_file}")
+            subject_type = "FILE"
+        else:
+            subject_type = "LINE"
+
+        path = relevant_file.strip()
+        # absolute_position is a new-file line; Gitea only honours new_position while
+        # old_position is 0, otherwise it anchors the comment to the old side.
+        payload = (dict(body=body, path=path, old_position=0, new_position=absolute_position)
+                   if subject_type == "LINE" else {})
+        self.publish_inline_comments([payload])
+
+
+    def publish_inline_comments(self, comments: List[Dict[str, Any]],body : str = "Inline comment") -> bool:
+        try:
+            response = self.repo_api.create_inline_comment(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number if self.enabled_pr else self.issue_number,
+                body=body,
+                commit_id=self.last_commit.sha if self.last_commit else "",
+                comments=comments
+            )
+        except ApiException as e:
+            self.logger.error(f"Error publishing inline comment: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error publishing inline comment: {e}")
+            return False
+
+        if not response:
+            self.logger.error("Failed to publish inline comment")
+            return False
+
+        self.logger.info("Inline comment published")
+        return True
+
+    def publish_code_suggestions(self, suggestions: List[Dict[str, Any]]) -> bool:
+        """Publish code suggestions"""
+        publishable_count = 0
+        published_count = 0
+        for suggestion in suggestions:
+            body = suggestion.get("body","")
+            if not body:
+                self.logger.error("No body provided for the suggestion")
+                continue
+
+            path = suggestion.get("relevant_file","")
+            # relevant_lines_start is an absolute position in the new file. Gitea anchors a
+            # review comment to the old side whenever old_position is non-zero, ignoring
+            # new_position in that case, so keep old_position at 0 to stay on the new side.
+            new_position = suggestion.get("relevant_lines_start", 0)
+            title_body = (suggestion["original_suggestion"].get("suggestion_content","")
+                          if "original_suggestion" in suggestion else "")
+            payload = dict(body=body, path=path, old_position=0, new_position=new_position)
+            publishable_count += 1
+            if title_body:
+                title_body = f"**Suggestion:** {title_body}"
+                published = self.publish_inline_comments([payload],title_body)
+            else:
+                published = self.publish_inline_comments([payload])
+            if published:
+                published_count += 1
+
+        # A partial failure must not report failure: the caller republishes the whole
+        # list, which would post the already-accepted suggestions a second time.
+        return published_count > 0 or publishable_count == 0
+
+
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
+        """Add a named reaction to a comment"""
+        try:
+            comments = self.repo_api.list_all_comments(
+                owner=self.owner,
+                repo=self.repo,
+                index=self.pr_number if self.enabled_pr else self.issue_number
+            )
+
+            comment_ids = [comment.id for comment in comments]
+            if issue_comment_id not in comment_ids:
+                self.logger.error(f"Comment ID {issue_comment_id} not found. Available IDs: {comment_ids}")
+                return None
+
+            response = self.repo_api.add_reaction_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=issue_comment_id,
+                reaction=reaction
+            )
+
+            if not response:
+                self.logger.error("Failed to add eyes reaction")
+                return None
+
+            return response[0].id if isinstance(response, tuple) else response.id
+
+        except ApiException as e:
+            self.logger.error(f"Error adding eyes reaction: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return None
+
+    def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
+        """Remove the reaction from a comment; the Gitea API removes by comment, so `reaction_id` is unused."""
+        try:
+            response = self.repo_api.remove_reaction_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=issue_comment_id
+            )
+            if not response:
+                self.logger.error("Failed to remove reaction")
+                return False
+            return True
+        except ApiException as e:
+            self.logger.error(f"Error removing reaction: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return False
+
+    def get_commit_messages(self)-> str:
+        """Get commit messages for the PR"""
+        max_tokens = get_settings().get("CONFIG.MAX_COMMITS_TOKENS", None)
+        pr_commits = self.repo_api.get_pr_commits(
+            owner=self.owner,
+            repo=self.repo,
+            pr_number=self.pr_number
+        )
+
+        if not pr_commits:
+            self.logger.error("Failed to get commit messages")
+            return ""
+
+        try:
+            commit_messages = [commit["commit"]["message"] for commit in pr_commits if commit]
+
+            if not commit_messages:
+                self.logger.error("No commit messages found")
+                return ""
+
+            commit_message = "\n".join([f"{i + 1}. {message}" for i, message in enumerate(commit_messages)])
+            if max_tokens:
+                commit_message = clip_tokens(commit_message, max_tokens)
+
+            return commit_message
+        except Exception as e:
+            self.logger.error(f"Error processing commit messages: {str(e)}")
+            return ""
+
+    def _get_file_content_from_base(self, filename: str) -> str:
+        return self.repo_api.get_file_content(
+            owner=self.owner,
+            repo=self.repo,
+            commit_sha=self.base_sha,
+            filepath=filename
+        )
+
+    def _get_file_content_from_latest_commit(self, filename: str) -> str:
+        return self.repo_api.get_file_content(
+            owner=self.owner,
+            repo=self.repo,
+            commit_sha=self.last_commit.sha if self.last_commit else self.sha,
+            filepath=filename
+        )
+
+    def get_diff_files(self) -> List[FilePatchInfo]:
+        """Get files that were modified in the PR"""
+        if self.diff_files is not None:
+            return self.diff_files
+
+        # Apply [ignore] rules at diff time, after apply_repo_settings() has merged
+        # the repository-level .pr_agent.toml (the provider is constructed before
+        # those settings exist). This matches the other providers, which filter
+        # lazily inside their diff fetch. See #2620.
+        diff_git_files = filter_ignored(list(self._get_changed_files()), platform="gitea")
+
+        invalid_files_names = []
+        counter_valid = 0
+        diff_files = []
+        for file in diff_git_files:
+            filename = file.get("filename")
+            if not filename:
+                continue
+
+            if not is_valid_file(filename):
+                invalid_files_names.append(filename)
+                continue
+
+            counter_valid += 1
+            avoid_load = False
+            patch = self.file_diffs.get(filename,"")
+            head_file = ""
+            base_file = ""
+
+            if counter_valid >= MAX_FILES_ALLOWED_FULL and patch and not self.incremental.is_incremental:
+                avoid_load = True
+                if counter_valid == MAX_FILES_ALLOWED_FULL:
+                    self.logger.info("Too many files in PR, will avoid loading full content for rest of files")
+
+            if avoid_load:
+                head_file = ""
+            else:
+                # Get file content from this pr only when the full content is needed.
+                self.__add_file_content(filename)
+                head_file = self.file_contents.get(filename,"")
+
+            status = file.get("status","")
+
+            if self.incremental.is_incremental and self.unreviewed_files_map:
+                base_file = self._get_file_content_from_latest_commit(filename)
+                self.unreviewed_files_map[filename] = patch
+            else:
+                # An added file cannot exist at base_sha, so fetching it there only costs a
+                # request and logs an error. Matches GithubProvider.get_diff_files().
+                if avoid_load or status == 'added':
+                    base_file = ""
+                else:
+                    base_file = self._get_file_content_from_base(filename)
+
+            num_plus_lines = file.get("additions",0)
+            num_minus_lines = file.get("deletions",0)
+
+            if status == 'added':
+                edit_type = EDIT_TYPE.ADDED
+            elif status == 'removed' or status == 'deleted':
+                edit_type = EDIT_TYPE.DELETED
+            elif status == 'renamed':
+                edit_type = EDIT_TYPE.RENAMED
+            elif status == 'modified' or status == 'changed':
+                edit_type = EDIT_TYPE.MODIFIED
+            else:
+                self.logger.error(f"Unknown edit type: {status}")
+                edit_type = EDIT_TYPE.UNKNOWN
+
+            file_patch_info = FilePatchInfo(
+                base_file=base_file,
+                head_file=head_file,
+                patch=patch,
+                filename=filename,
+                num_minus_lines=num_minus_lines,
+                num_plus_lines=num_plus_lines,
+                edit_type=edit_type
+            )
+            diff_files.append(file_patch_info)
+
+        if invalid_files_names:
+            self.logger.info(f"Filtered out files with invalid extensions: {invalid_files_names}")
+
+        self.filtered_diff_file_names = invalid_files_names
+        self.diff_files = diff_files
+        return diff_files
+
+    def get_line_link(self, relevant_file, relevant_line_start, relevant_line_end = None) -> str:
+        encoded_file = quote(relevant_file, safe="/")
+        link = f"{self.base_url_html}/{self.owner}/{self.repo}/src/branch/{quote(self.get_pr_branch())}/{encoded_file}"
+        relevant_line_start, relevant_line_end = self._normalize_line_range(
+            relevant_line_start, relevant_line_end
+        )
+        if relevant_line_start == -1:
+            pass
+        elif relevant_line_end:
+            link += f"#L{relevant_line_start}-L{relevant_line_end}"
+        else:
+            link += f"#L{relevant_line_start}"
+
+        self.logger.info(f"Generated link: {link}")
+        return link
+
+    def get_pr_id(self):
+        try:
+            pr_id = f"{self.repo}/{self.pr_number}"
+            return pr_id
+        except:
+            return ""
+
+    def _get_changed_files(self) -> List[Dict[str, Any]]:
+        """Cache only a complete changed-file inventory, including a valid empty one."""
+        if self.git_files is None:
+            try:
+                files = self.repo_api.get_change_file_pull_request(
+                    owner=self.owner, repo=self.repo, pr_number=self.pr_number
+                )
+            except Exception as exc:
+                raise IncompleteGiteaPullRequestFilesError(
+                    "Gitea changed-file inventory is unavailable or incomplete"
+                ) from exc
+            self.git_files = files
+        return self.git_files
+
+    def get_files(self) -> List[str]:
+        """Get all files in the PR"""
+        return [file["filename"] for file in self._get_changed_files()]
+
+    def get_num_of_files(self) -> int:
+        """Get number of files changed in the PR"""
+        return len(self._get_changed_files())
+
+    def get_issue_comments(self) -> List[Dict[str, Any]]:
+        """Get all comments in the PR"""
+        index = self.issue_number if self.enabled_issue else self.pr_number
+        comments = self.repo_api.list_all_comments(
+            owner=self.owner,
+            repo=self.repo,
+            index=index
+        )
+        if not isinstance(comments, list):
+            self.logger.error("Failed to get comments")
+            raise RuntimeError("Failed to get comments")
+
+        return comments
+
+    @cache_languages
+    def get_languages(self) -> Set[str]:
+        """Get programming languages used in the repository"""
+        languages = self.repo_api.get_languages(
+            owner=self.owner,
+            repo=self.repo
+        )
+
+        return languages
+
+    def get_pr_branch(self) -> str:
+        """Get the branch name of the PR"""
+        if not self.pr:
+            self.logger.error("Failed to get PR branch")
+            return ""
+
+        if not self.pr.head:
+            self.logger.error("PR head not found")
+            return ""
+
+        return self.pr.head.ref if self.pr.head.ref else ""
+
+    def get_pr_description_full(self) -> str:
+        """Get full PR description with metadata"""
+        if not self.pr:
+            self.logger.error("Failed to get PR description")
+            return ""
+
+        return self.pr.body if self.pr.body else ""
+
+    def get_pr_labels(self,update=False) -> List[str]:
+        """Get labels assigned to the PR"""
+        if not update:
+            if not self.pr.labels:
+                self.logger.error("Failed to get PR labels")
+                return []
+            return [label.name for label in self.pr.labels]
+
+        labels = self.repo_api.get_issue_labels(
+            owner=self.owner,
+            repo=self.repo,
+            issue_number=self.pr_number
+        )
+        if not labels:
+            self.logger.error("Failed to get PR labels")
+            return []
+
+        return [label.name for label in labels]
+
+    def get_repo_settings(self):
+        """Get repository settings (org/global first, then repo-local)."""
+        settings_files = []
+        global_settings = self._get_global_repo_settings()
+        if global_settings:
+            settings_files.append(("global", global_settings))
+
+        if not self.repo_settings:
+            self.logger.error("Repository settings not found")
+            return settings_files if settings_files else ""
+
+        target_ref = self.base_sha or self.base_ref
+        if not target_ref:
+            self.logger.warning("Cannot get repository settings: no target/base ref available")
+            return settings_files if settings_files else ""
+
+        response = self.repo_api.get_file_content(
+            owner=self.owner,
+            repo=self.repo,
+            commit_sha=target_ref,
+            filepath=self.repo_settings
+        )
+        if not response:
+            self.logger.error("Failed to get repository settings")
+        else:
+            # utils.apply_repo_settings() writes this via os.write() and later
+            # calls .decode() on it, so it must be bytes to match the GitHub/
+            # GitLab/Bitbucket contract. get_file_content() decodes the raw bytes
+            # to str, so re-encode here (see issue #2347).
+            settings_files.append(("local", response.encode('utf-8')))
+
+        return settings_files if settings_files else ""
+
+    def get_owning_namespace(self) -> Optional[str]:
+        return getattr(self, "owner", None)
+
+    def _get_global_settings_cache_key(self, owner: str) -> str:
+        return f"gitea:{getattr(self, 'base_url', '')}:{owner}"
+
+    def _fetch_global_repo_settings(self, owner, settings_repo):
+        # Owner-wide global settings live in the configured <owner>/<settings_repo> repository.
+        # A missing settings repo/file (404) is an expected fallback -> return "" (cached).
+        try:
+            repo = self.repo_api.repo_get(owner, settings_repo)
+            default_branch = getattr(repo, "default_branch", None)
+            if not default_branch:
+                return ""
+            content = self.repo_api.get_file_content(
+                owner=owner,
+                repo=settings_repo,
+                commit_sha=default_branch,
+                filepath=".pr_agent.toml",
+            )
+            return content.encode('utf-8')
+        except ApiException as e:
+            if getattr(e, "status", None) == 404:
+                return ""
+            raise
+
+
+    def get_user_id(self) -> str:
+        """Get the ID of the authenticated user"""
+        return f"{self.pr.user.id}" if self.pr else ""
+
+    def is_supported(self, capability) -> bool:
+        """Check if the provider is supported"""
+        return True
+
+    def get_git_repo_url(self, issues_or_pr_url: str) -> str:
+        return f"{self.base_url}/{self.owner}/{self.repo}.git" #base_url / <OWNER>/<REPO>.git
+
+    def publish_description(self, pr_title: str, pr_body: str) -> None:
+        """Publish PR description"""
+        edit_kwargs = dict(
+            owner=self.owner,
+            repo=self.repo,
+            pr_number=self.pr_number if self.enabled_pr else self.issue_number,
+            body=pr_body,
+        )
+        if pr_title is not None:
+            edit_kwargs["title"] = pr_title
+        response = self.repo_api.edit_pull_request(**edit_kwargs)
+
+        if not response:
+            self.logger.error("Failed to publish PR description")
+            raise RuntimeError("Failed to publish PR description")
+
+        self.logger.info("PR description published successfully")
+        if self.enabled_pr:
+            self.pr = self.repo_api.get_pull_request(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number
+            )
+
+    def publish_labels(self, labels: List[int]) -> None:
+        """Publish labels to the PR"""
+        if not labels:
+            self.logger.error("No labels provided to publish")
+            return None
+
+        response = self.repo_api.add_labels(
+            owner=self.owner,
+            repo=self.repo,
+            issue_number=self.pr_number if self.enabled_pr else self.issue_number,
+            labels=labels
+        )
+
+        if response:
+            self.logger.info("Labels added successfully")
+
+    def remove_comment(self, comment) -> None:
+        """Remove a specific comment"""
+        if not comment:
+            return
+
+        try:
+            comment_id = comment.get("comment_id") if isinstance(comment, dict) else comment.id
+            if not comment_id:
+                self.logger.error("Comment ID not found")
+                return None
+            self.repo_api.remove_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=comment_id
+            )
+
+            if self.comments_list and comment in self.comments_list:
+                self.comments_list.remove(comment)
+
+            self.logger.info(f"Comment removed successfully: {comment}")
+        except ApiException as e:
+            self.logger.error(f"Error removing comment: {e}")
+            raise e
+
+    def remove_initial_comment(self) -> None:
+        """Remove the initial comment"""
+        # Iterate over a snapshot: remove_comment() drops the comment from
+        # comments_list, so mutating it mid-iteration skips the next element
+        # and leaves every other temporary comment behind.
+        for comment in list(self.comments_list):
+            try:
+                if not comment.get("is_temporary"):
+                    continue
+                self.remove_comment(comment)
+            except Exception as e:
+                self.logger.error(f"Error removing comment: {e}")
+                continue
+            self.logger.info(f"Removed initial comment: {comment.get('comment_id')}")
+
+    #Clone related
+    def _prepare_clone_url_with_token(self, repo_url_to_clone: str) -> str | None:
+        #For example, to clone:
+        #https://github.com/Codium-ai/pr-agent-pro.git
+        #Need to embed inside the github token:
+        #https://<token>@github.com/Codium-ai/pr-agent-pro.git
+
+        gitea_token = self.gitea_access_token
+        gitea_base_url = self.base_url
+        scheme = gitea_base_url.split("://")[0]
+        scheme += "://"
+        if not all([gitea_token, gitea_base_url]):
+            get_logger().error("Either missing auth token or missing base url")
+            return None
+        base_url = gitea_base_url.split(scheme)[1]
+        if not base_url:
+            get_logger().error(f"Base url: {redact_credentials(gitea_base_url)} has an empty base url")
+            return None
+        if base_url not in repo_url_to_clone:
+            get_logger().error(f"url to clone: {redact_credentials(repo_url_to_clone)} "
+                               f"does not contain {redact_credentials(gitea_base_url)}")
+            return None
+        repo_full_name = repo_url_to_clone.split(base_url)[-1]
+        if not repo_full_name:
+            get_logger().error(f"url to clone: {redact_credentials(repo_url_to_clone)} is malformed")
+            return None
+
+        clone_url = scheme
+        clone_url += f"{gitea_token}@{base_url}{repo_full_name}"
+        return clone_url
+
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False) -> str:
+        """Get content of a file from the PR target (base) branch.
+
+        This method implements the interface required by PR #2387 repo_context feature.
+        It reads only from the PR target ref (base sha/ref) and never from the PR head,
+        so a PR cannot supply its own instruction files to influence its own review.
+        When from_default_branch is set, it reads from the repository default branch instead.
+        """
+        try:
+            if not self.owner or not self.repo:
+                self.logger.warning("Cannot get repo file content: owner or repo not set")
+                return ""
+
+            if from_default_branch:
+                ref = self.repo_api.repo_get(self.owner, self.repo).default_branch
+            else:
+                # Only trust the PR target (base) ref — never fall back to the PR head (self.sha).
+                ref = self.base_sha or self.base_ref
+            if not ref:
+                self.logger.warning("Cannot get repo file content: no target/base ref available")
+                return ""
+
+            content = self.repo_api.get_file_content(
+                owner=self.owner,
+                repo=self.repo,
+                commit_sha=ref,
+                filepath=file_path
+            )
+            return content
+        except ApiException as e:
+            # A missing file is an expected "no context" outcome. Let transient/unexpected
+            # errors propagate so build_repo_context() treats them as a fetch error and does
+            # not cache an empty result until the TTL expires.
+            if getattr(e, "status", None) == 404:
+                return ""
+            raise
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        if from_default_branch:
+            return self.repo_api.repo_get(self.owner, self.repo).default_branch
+        # Only trust the PR target (base) ref — never the PR head (self.sha).
+        return self.base_sha or self.base_ref
+
+class RepoApi(giteapy.RepositoryApi):
+    def __init__(self, client: giteapy.ApiClient):
+        self.repository = giteapy.RepositoryApi(client)
+        self.issue = giteapy.IssueApi(client)
+        self.logger = get_logger()
+        super().__init__(client)
+
+    def create_inline_comment(self, owner: str, repo: str, pr_number: int,
+                              body : str ,commit_id : str, comments: List[Dict[str, Any]]):
+        body = {
+            "body": body,
+            "comments": comments,
+            "commit_id": commit_id,
+            # Gitea/Forgejo defaults an event-less review to a draft (state
+            # PENDING), invisible to everyone but the review's author until
+            # someone manually submits it from the web UI. There is no such
+            # "submit" step in this flow, so the review must be submitted as
+            # a real event up front.
+            "event": "COMMENT",
+        }
+        return self.api_client.call_api(
+            '/repos/{owner}/{repo}/pulls/{pr_number}/reviews',
+            'POST',
+            path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number},
+            body=body,
+            response_type='Repository',
+            auth_settings=['AuthorizationHeaderToken']
+        )
+
+    def create_comment(self, owner: str, repo: str, index: int, comment: str):
+        body = {
+            "body": comment
+        }
+        return self.issue.issue_create_comment(
+            owner=owner,
+            repo=repo,
+            index=index,
+            body=body
+        )
+
+    def edit_comment(self, owner: str, repo: str, comment_id: int, comment: str):
+        body = {
+            "body": comment
+        }
+        return self.issue.issue_edit_comment(
+            owner=owner,
+            repo=repo,
+            id=comment_id,
+            body=body
+        )
+
+    def remove_comment(self, owner: str, repo: str, comment_id: int):
+        return self.issue.issue_delete_comment(
+            owner=owner,
+            repo=repo,
+            id=comment_id
+        )
+
+    def list_all_comments(self, owner: str, repo: str, index: int):
+        return self.issue.issue_get_comments(
+            owner=owner,
+            repo=repo,
+            index=index
+        )
+
+    def get_pull_request_diff(self, owner: str, repo: str, pr_number: int) -> str:
+        """Get the diff content of a pull request using direct API call"""
+        try:
+            url = f'/repos/{owner}/{repo}/pulls/{pr_number}.diff'
+
+            response = self.api_client.call_api(
+                url,
+                'GET',
+                path_params={},
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+
+            if hasattr(response, 'data'):
+                raw_data = response.data.read()
+                return raw_data.decode('utf-8', errors='replace')
+            elif isinstance(response, tuple):
+                raw_data = response[0].read()
+                return raw_data.decode('utf-8', errors='replace')
+            else:
+                error_msg = f"Unexpected response format received from API: {type(response)}"
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+        except ApiException as e:
+            self.logger.error(f"Error getting diff: {str(e)}")
+            raise e
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {str(e)}")
+            raise e
+
+    def get_pull_request(self, owner: str, repo: str, pr_number: int):
+        """Get pull request details including description"""
+        return self.repository.repo_get_pull_request(
+            owner=owner,
+            repo=repo,
+            index=pr_number
+        )
+
+    def edit_pull_request(self, owner: str, repo: str, pr_number: int, body: str, title: Optional[str] = None):
+        """Edit pull request description"""
+        body = {
+            "body": body
+        }
+        if title is not None:
+            body["title"] = title
+        return self.repository.repo_edit_pull_request(
+            owner=owner,
+            repo=repo,
+            index=pr_number,
+            body=body
+        )
+
+    def _list_all_pages(self, url: str, page_size: int = 50) -> list:
+        """Walk a paginated list endpoint until it answers with an empty page.
+
+        Gitea serves at most `limit` items per page and caps `limit` at the server's own
+        MAX_RESPONSE_ITEMS, so a page shorter than `page_size` is not necessarily the last
+        one. Errors propagate: a failure mid-way must not yield a silently truncated list.
+        """
+        items = []
+        page = 1
+        while True:
+            response = self.api_client.call_api(
+                url,
+                'GET',
+                path_params={},
+                query_params=[('page', page), ('limit', page_size)],
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+
+            if hasattr(response, 'data'):
+                raw_data = response.data.read()
+            elif isinstance(response, tuple):
+                raw_data = response[0].read()
+            else:
+                return items
+
+            page_items = json.loads(raw_data.decode('utf-8'))
+            if not isinstance(page_items, list) or not page_items:
+                return items
+            items.extend(page_items)
+            page += 1
+
+    def get_change_file_pull_request(self, owner: str, repo: str, pr_number: int):
+        """Get changed files in the pull request"""
+        files = []
+        page = 1
+        while True:
+            response = self.api_client.call_api(
+                f'/repos/{owner}/{repo}/pulls/{pr_number}/files',
+                'GET',
+                path_params={},
+                query_params=[('page', page), ('limit', 50)],
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+            raw_response = response[0] if isinstance(response, tuple) else response.data
+            page_items = json.loads(raw_response.read().decode('utf-8'))
+            if not isinstance(page_items, list):
+                raise ValueError("Invalid Gitea changed-files page")
+            if any(
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("filename"), str)
+                or not item["filename"]
+                for item in page_items
+            ):
+                raise ValueError("Invalid Gitea changed-file entry")
+            if not page_items:
+                return files
+            files.extend(page_items)
+            page += 1
+
+    def get_languages(self, owner: str, repo: str):
+        """Get programming languages used in the repository"""
+        try:
+            url = f'/repos/{owner}/{repo}/languages'
+
+            response = self.api_client.call_api(
+                url,
+                'GET',
+                path_params={},
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+
+            if hasattr(response, 'data'):
+                raw_data = response.data.read()
+                return json.loads(raw_data.decode('utf-8'))
+            elif isinstance(response, tuple):
+                raw_data = response[0].read()
+                return json.loads(raw_data.decode('utf-8'))
+
+            return {}
+
+        except ApiException as e:
+            self.logger.error(f"Error getting languages: {e}")
+            return {}
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return {}
+
+    def get_file_content(self, owner: str, repo: str, commit_sha: str, filepath: str) -> str:
+        """Get raw file content from a specific commit"""
+
+        try:
+            url = f'/repos/{owner}/{repo}/raw/{filepath}'
+            query_params = []
+            if commit_sha:
+                query_params.append(('ref', commit_sha))
+
+            response = self.api_client.call_api(
+                url,
+                'GET',
+                path_params={},
+                query_params=query_params,
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+
+            # Decode via the shared fallback chain (utf-8, then iso-8859-1/latin-1/
+            # ascii/utf-16) so legitimate non-UTF-8 *text* (e.g. UTF-16) is preserved
+            # rather than dropped, while binary payloads no longer crash the provider.
+            # decode_if_bytes returns "" only if every encoding fails; binary files are
+            # filtered downstream by extension (should_skip_patch).
+            if hasattr(response, 'data'):
+                raw_data = response.data.read()
+                return decode_if_bytes(raw_data)
+            elif isinstance(response, tuple):
+                raw_data = response[0].read()
+                return decode_if_bytes(raw_data)
+
+            return ""
+
+        except ApiException as e:
+            self.logger.error(f"Error getting file: {filepath}, content: {e}")
+            return ""
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return ""
+
+    def get_issue_labels(self, owner: str, repo: str, issue_number: int):
+        """Get labels assigned to the issue"""
+        return self.issue.issue_get_labels(
+            owner=owner,
+            repo=repo,
+            index=issue_number
+        )
+
+    def list_all_commits(self, owner: str, repo: str):
+        return self.repository.repo_get_all_commits(
+            owner=owner,
+            repo=repo
+        )
+
+    def add_reaction_comment(self, owner: str, repo: str, comment_id: int, reaction: str):
+        body = {
+            "content": reaction
+        }
+        return self.api_client.call_api(
+            '/repos/{owner}/{repo}/issues/comments/{id}/reactions',
+            'POST',
+            path_params={'owner': owner, 'repo': repo, 'id': comment_id},
+            body=body,
+            response_type='Repository',
+            auth_settings=['AuthorizationHeaderToken']
+        )
+
+    def remove_reaction_comment(self, owner: str, repo: str, comment_id: int):
+        return self.api_client.call_api(
+            '/repos/{owner}/{repo}/issues/comments/{id}/reactions',
+            'DELETE',
+            path_params={'owner': owner, 'repo': repo, 'id': comment_id},
+            response_type='Repository',
+            auth_settings=['AuthorizationHeaderToken']
+        )
+
+    def add_labels(self, owner: str, repo: str, issue_number: int, labels: List[int]):
+        body = {
+            "labels": labels
+        }
+        return self.issue.issue_add_label(
+            owner=owner,
+            repo=repo,
+            index=issue_number,
+            body=body
+        )
+
+    def get_pr_commits(self, owner: str, repo: str, pr_number: int):
+        """Get all commits in a pull request"""
+        try:
+            return self._list_all_pages(f'/repos/{owner}/{repo}/pulls/{pr_number}/commits')
+        except ApiException as e:
+            self.logger.error(f"Error getting PR commits: {e}")
+            return []
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return []
