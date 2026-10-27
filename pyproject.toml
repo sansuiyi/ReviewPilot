@@ -61,6 +61,10 @@ dependencies = [
   # Recheck LiteLLM's declared constraint on upgrade; the observability guard covers callback imports.
   "pydantic-settings==2.14.2",
   "html2text==2024.2.26",
+  # ReviewPilot agent execution loop (pr_agent/agent_exec). langgraph manages the
+  # review -> decide -> tools -> verify -> finalize state machine; the floor is the
+  # last vetted release and the <2 cap avoids the (API-breaking) major bump.
+  "langgraph>=0.2,<2",
   # pr_agent/telemetry imports these directly; already resolved transitively via
   # langfuse and litellm, pinned here to lock the version the code is tested against.
   "opentelemetry-api==1.43.0",

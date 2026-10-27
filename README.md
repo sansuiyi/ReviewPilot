@@ -1,234 +1,241 @@
+# ReviewPilot
 
+**A bounded, auditable AI code-review agent — built on top of [PR-Agent](https://github.com/qodo-ai/pr-agent).**
 
-<br />
+English · [简体中文](README.zh-CN.md)
 
-<div align="center">
+![ReviewPilot agent loop preview](docs/static/img/reviewpilot-agent-preview.png)
 
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/logo-dark.png" width="330">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/logo-light.png" width="330">
-  <img src="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/logo-light.png" alt="logo" width="330">
-
-</picture>
-<br>
-The Original Open-Source PR Reviewer
-<br><br>
-<a href="https://github.com/the-pr-agent/pr-agent/commits/main">
-<img alt="GitHub" src="https://img.shields.io/github/last-commit/the-pr-agent/pr-agent/main?style=for-the-badge" height="20">
-</a>
-</div>
+> The preview shows a reproducible offline replay: the real LangGraph, tools and
+> guardrails run end-to-end, while the model replies are scripted.
 
 ---
 
- This repository contains the open-source PR Agent Project.
- It is not the Qodo offering for open-source projects.
+## What this is
 
-PR-Agent is an open-source, AI-powered code review agent and a community-maintained legacy project of Qodo. It is distinct from Qodo's primary AI code review offering, which provides a feature-rich, context-aware experience. Qodo offers a free version for open-source projects and integrates seamlessly with GitHub, GitLab, Bitbucket, and Azure DevOps for high-quality automated reviews.
+PR-Agent already ships a strong single-shot review pipeline. ReviewPilot adds a
+**bounded agent loop** on top of it: the model can inspect the diff, call
+read-only tools, verify its own high-risk findings, and only then publish a
+review. Every step is recorded, and every limit is enforced by the harness —
+not by the prompt.
 
+The loop is **opt-in**. With `[agent_exec].enabled = false` (the default),
+`/review` behaves exactly like upstream PR-Agent.
 
-## Sponsors
+## Highlights
 
-PR-Agent is a community-maintained open-source project, with its ongoing development supported by our sponsors. If you'd like to support the project, consider [becoming a sponsor](https://github.com/sponsors/naorpeled).
+| Capability | Where it lives |
+|---|---|
+| OODA agent loop (`orient → review → tools/verify → finalize`) | `pr_agent/agent_exec/graph.py` |
+| Server-enforced step / tool-call / token budgets | `pr_agent/agent_exec/policy.py` |
+| Loop detection (repeated decisions force finalize) | `pr_agent/agent_exec/nodes.py` |
+| Jev rule: high-risk + low-confidence findings must be verified | `pr_agent/agent_exec/nodes.py` |
+| Independent LLM verification (LLM-as-Judge) | `pr_agent/agent_exec/nodes.py::verify_node` |
+| Structured, replayable trajectory + audit events | `pr_agent/agent_exec/models.py` |
+| Read-only tool whitelist with per-tool timeout | `pr_agent/agent_exec/tools/` |
+| MCP-style tool descriptors + external tool adapter | `pr_agent/agent_exec/tools/base.py` |
+| Multi-sub-agent fan-out with deterministic merge | `pr_agent/agent_exec/federation.py` |
+| Reproducible benchmark harness (precision / recall / completion) | `pr_agent/agent_exec/benchmark.py` |
+| `/review` integration behind a feature flag | `pr_agent/tools/pr_reviewer.py` |
 
-<p align="center">
-  <h3 align="center">🥇 Gold Sponsor</h3>
-</p>
+## Architecture
 
-<p align="center">
-  <a target="_blank" href="https://www.qodo.ai/">
-    <img alt="Qodo — Gold sponsor" src="https://www.qodo.ai/wp-content/uploads/2025/03/qodo-logo.svg" width="150">
-  </a>
-</p>
-
-<p align="center">
-  <a target="_blank" href="https://www.qodo.ai/solutions/open-source/">Free version of Qodo for open-source projects</a>
-</p>
-
-
-## Table of Contents
-
-- [Getting Started](#getting-started)
-- [Why Use PR-Agent?](#why-use-pr-agent)
-- [Features](#features)
-- [See It in Action](#see-it-in-action)
-- [How It Works](#how-it-works)
-- [Data Privacy](#data-privacy)
-- [Contributing](#contributing)
-
-## Getting Started
-
-> [!NOTE]
-> **Docker Hub namespace migration.** Releases `0.34.2` and later are published under [`pragent/pr-agent`](https://hub.docker.com/r/pragent/pr-agent). Older releases (up to and including `v0.31`) remain available at the legacy [`codiumai/pr-agent`](https://hub.docker.com/r/codiumai/pr-agent) namespace as a frozen archive — no new images are pushed there. Update any pinned `image:` / `docker pull` / `uses: docker://` references when upgrading to `0.34.2+`.
-
-### 🚀 Quick Start for PR-Agent
-
-#### 1. GitHub Action (Recommended)
-
-Add automated PR reviews to your repository with a simple workflow file:
-
-```yaml
-# .github/workflows/pr-agent.yml
-name: PR Agent
-on:
-  pull_request:
-    types: [opened, synchronize]
-jobs:
-  pr_agent_job:
-    runs-on: ubuntu-latest
-    steps:
-    - name: PR Agent action step
-      uses: the-pr-agent/pr-agent@main
-      env:
-        OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```mermaid
+flowchart LR
+    S((START)) --> O[orient<br/>deterministic summary]
+    O --> R[review<br/>model decides]
+    R -->|tools| T[tools<br/>whitelist + timeout]
+    R -->|verify| V[verify<br/>independent judge]
+    R -->|finalize| F[finalize]
+    T --> O
+    V --> O
+    F --> E((END))
 ```
-[Full GitHub Action setup guide](https://docs.pr-agent.ai/installation/github/#run-as-a-github-action)
 
-#### 2. CLI Usage (Local Development)
+The model can only choose between three actions: `tools`, `verify`, `finalize`.
+The harness may override that choice when a budget is exhausted, a loop is
+detected, or a finding needs verification.
 
-Run PR-Agent locally on your repository:
+## Quick start
 
 ```bash
-pip install "pr-agent[github]"
-export OPENAI_KEY=your_key_here
-pr-agent --pr_url https://github.com/owner/repo/pull/123 review
+# Python >= 3.12 and uv >= 0.12.10
+uv sync
+
+# Configure secrets
+cp pr_agent/settings/.secrets_template.toml pr_agent/settings/.secrets.toml
+# fill [openai] key and [github] user_token
+
+# Run a normal review
+PYTHONPATH=. uv run pr-agent --pr_url=https://github.com/owner/repo/pull/1 review
+
+# Review a local diff without a PR
+PYTHONPATH=. uv run pr-agent --diff-file=changes.patch --output=result.md review
 ```
-Git provider SDKs are optional extras: install the one for your provider ([list](https://docs.pr-agent.ai/installation/locally/#using-pip-package)), or `pr-agent[all]` for every integration.
-[Complete CLI setup guide](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#local-repo-cli)
 
-#### 3. Other Platforms
+Enable the ReviewPilot agent (repo-level `.pr_agent.toml`):
 
-- [GitLab webhook setup](https://docs.pr-agent.ai/installation/gitlab/)
-- [BitBucket app installation](https://docs.pr-agent.ai/installation/bitbucket/)
-- [Azure DevOps setup](https://docs.pr-agent.ai/installation/azure/)
+```toml
+[agent_exec]
+enabled = true
+```
 
-## News and Updates
-
-Full notes for every release are on the [Releases page](https://github.com/the-pr-agent/pr-agent/releases).
-
-
-## Why Use PR-Agent?
-
-### 🎯 Built for Real Development Teams
-
-**Fast & Affordable**: Each tool (`/review`, `/improve`, `/ask`) uses a single LLM call (~30 seconds, low cost)
-
-**Handles Any PR Size**: Our [PR Compression strategy](https://docs.pr-agent.ai/core-abilities/compression_strategy/) effectively processes both small and large PRs
-
-**Highly Customizable**: JSON-based prompting allows easy customization of review categories and behavior via [configuration files](pr_agent/settings/configuration.toml)
-
-**Platform Agnostic**:
-- **Git Providers**: GitHub, GitLab, BitBucket, Azure DevOps, Gitea
-- **Deployment**: CLI, GitHub Actions, Docker, self-hosted, webhooks
-- **AI Models**: OpenAI GPT, Anthropic Claude, Google Gemini, DeepSeek, Mistral, and any other model reachable through LiteLLM (Azure OpenAI, AWS Bedrock, Vertex AI, Databricks, OpenRouter, Ollama, and more) — see [Changing a model](https://docs.pr-agent.ai/usage-guide/changing_a_model/)
-
-**Open Source Benefits**:
-- Full control over your data and infrastructure
-- Customize prompts and behavior for your team's needs
-- No vendor lock-in
-- Community-driven development
-
-## Features
-
-<div style="text-align:left;">
-
-See the current [feature and git provider support matrix](https://docs.pr-agent.ai/overview/supported_platforms/) in the PR-Agent documentation.
-
-⚠️ `/help_docs` is temporarily disabled since `v0.36.1` pending a fix for a credential-exposure issue ([#2445](https://github.com/the-pr-agent/pr-agent/issues/2445)).
-
-[//]: # (- Support for additional git providers is described in [here]&#40;./docs/Full_environments.md&#41;)
-___
-
-## See It in Action
-
-</div>
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/530">/describe</a></h4>
-<div align="center">
-<p float="center">
-<img src="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/describe_new_short_main.png" width="512">
-</p>
-</div>
-<hr>
-
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/732#issuecomment-1975099151">/review</a></h4>
-<div align="center">
-<p float="center">
-<kbd>
-<img src="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/review_new_short_main.png" width="512">
-</kbd>
-</p>
-</div>
-<hr>
-
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/732#issuecomment-1975099159">/improve</a></h4>
-<div align="center">
-<p float="center">
-<kbd>
-<img src="https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/improve_new_short_main.png" width="512">
-</kbd>
-</p>
-</div>
-
-<hr>
-
-### Usage Examples
-
-PR-Agent tools run as a comment on a PR or from the CLI. A few common ones:
+Or via environment variable:
 
 ```bash
-# Comment on a PR (GitHub/GitLab/Bitbucket/…):
-/describe
-/review
-/improve
-/ask "What does this PR change?" # free-text Q&A about the PR
-
-# Issue-scoped commands run on an issue instead of a PR:
-/similar_issue # find similar issues in the repository
-
-# Or locally via the CLI:
-pr-agent --pr_url <PR_URL> review
-pr-agent --issue_url <ISSUE_URL> similar_issue
+export AGENT_EXEC__ENABLED=true
 ```
 
-See the [Tools docs](https://docs.pr-agent.ai/tools/#usage-examples) for the full list of tools with example commands, and each tool's page for screenshots and options.
+With the flag on, `/review` routes to `ReviewAgentRunner` and publishes its
+`final_answer`; with it off, the original pipeline runs untouched.
 
-<hr>
+For a standalone loop run (no PR, no published comment):
 
-## How It Works
+```bash
+PYTHONPATH=. uv run python run_agent.py
+```
 
-The following diagram illustrates PR-Agent tools and their flow:
+## How a run is controlled
 
-![PR-Agent Tools](https://raw.githubusercontent.com/The-PR-Agent/pr-agent/main/docs/static/img/diagram-v0.9.png)
+| Node | OODA phase | Responsibility |
+|---|---|---|
+| `orient` | Orient | Deterministic environment summary: steps left, tool budget, current findings, decision history. No LLM call. |
+| `review` | Observe + Decide | Model returns JSON: `tools` / `verify` / `finalize`, plus findings on finalize. |
+| `tools` | Act | Executes one whitelisted tool under a timeout; records an audit event. |
+| `verify` | Act | Independent review pass on one targeted finding. |
+| `finalize` | — | Renders the final review text. |
 
-## Data Privacy
+Guardrails applied in server code:
 
-### Self-hosted PR-Agent
+- `max_steps` — hard cap on decision iterations.
+- `max_tool_calls` — hard cap on tool executions.
+- `tool_timeout_seconds` — per-tool timeout.
+- `loop_detection_window` — N identical consecutive decisions force finalize.
+- `enforce_tool_whitelist` — unregistered tools are refused, not executed.
 
-- If you host PR-Agent with your OpenAI API key, it is between you and OpenAI. You can read their API data privacy policy here:
-https://openai.com/enterprise-privacy
+### Jev: verification before finalize
 
-## Contributing
+Jev is not a separate model or classifier. It is a **harness rule plus an
+independent LLM pass**:
 
-To contribute to the project, get started by reading our [Contributing Guide](https://github.com/the-pr-agent/pr-agent/blob/main/CONTRIBUTING.md).
+1. The model proposes `finalize`.
+2. The harness scans the merged findings. If any finding is `risk_level=high`,
+   `confidence < verify_confidence_threshold` (default `0.6`) and
+   `verified is None`, the decision is rewritten to `verify`.
+3. The graph routes to `verify`, which calls the model again with a different
+   system prompt (`"You are an independent reviewer."`) and records
+   `verified` / `verification_note` on the finding.
+4. The loop returns to `orient → review`. A verified finding no longer triggers
+   Jev, so the next `finalize` succeeds. Refuted findings stay in the output,
+   marked `[refuted]`.
 
-For local verification, run `PYTHONPATH=. uv run pytest` from the repository root; it discovers the unit-test suite under `tests/unittest` by default. End-to-end tests under `tests/e2e_tests` require provider credentials and should be invoked explicitly, for example `PYTHONPATH=. uv run pytest tests/e2e_tests/test_github_app.py`.
+The gate uses **`Finding.confidence`**, not `Decision.confidence`. Verification
+is bounded by `max_steps`, so it cannot loop forever.
 
+## Multiple sub-agents
 
-## Big News for PR-Agent
+`ReviewerFederation` partitions diff files into batches and runs one bounded
+agent per batch concurrently, then merges findings deterministically:
 
-PR-Agent has a new home!
+```python
+from pr_agent.agent_exec.federation import ReviewerFederation
 
-After years of building this tool alongside the community, Qodo has donated PR-Agent to the open-source community - and we couldn't be more excited about what comes next.
+findings = await ReviewerFederation().review(diff_files, max_files_per_batch=1)
+```
 
-The project now lives in the PR-Agent org on GitHub, is fully community-owned, and is open for contributions and additional maintainers.
+Duplicates are collapsed by `(file_path, title, line, risk)`, and a verification
+verdict produced by any sub-agent is carried onto the merged record.
 
-What else changed:
-- Docs moved to - [docs.pr-agent.ai](https://docs.pr-agent.ai/)
-- Qodo Merge (Qodo 1.0), the hosted URL, which was the enterprise version of PR-Agent, has been rebranded and evolved into Qodo (Qodo 2.0), a full AI code review platform.
+## Benchmark
 
-## ❤️ Community
+`BenchmarkRunner` scores a dataset of PRs with ground-truth labels and reports
+precision, recall, completion rate, average tool calls, steps and token
+estimates, plus a weighted score.
 
-This open-source release remains here as a community contribution from Qodo — the origin of modern AI-powered code collaboration. We’re proud to share it and inspire developers worldwide.
+```python
+import asyncio
+from pr_agent.agent_exec.benchmark import BenchmarkRunner, load_dataset
+from pr_agent.agent_exec.runner import ReviewAgentRunner
 
-The project now has its first external maintainer, Naor ([@naorpeled](https://github.com/naorpeled)), and is currently in the process of being donated to an open-source foundation.
+async def main():
+    items = load_dataset("benchmark/prs.json")
+    report = await BenchmarkRunner(runner_factory=ReviewAgentRunner).run(items)
+    print(report.as_dict())
+
+asyncio.run(main())
+```
+
+A finding matches ground truth when `file_path` and `line_number` are equal and
+the title token overlap (Jaccard) is at least `0.5`.
+
+> The harness is shipped; the published precision/recall numbers depend on the
+> dataset and the model you run. No benchmark numbers are claimed in this README.
+
+## Tests
+
+```bash
+PYTHONPATH=. uv run pytest tests/unittest/agent_exec -q   # 34 passed
+uv run ruff check pr_agent/agent_exec pr_agent/tools/pr_reviewer.py tests/unittest/agent_exec
+```
+
+Current state of this repository: **34 agent tests passing**, ruff clean.
+
+## Project layout
+
+```
+pr_agent/agent_exec/
+├── runner.py        # bounded loop entry point
+├── graph.py         # LangGraph state machine
+├── nodes.py         # orient / review / tools / verify / finalize + guardrails
+├── policy.py        # budgets, timeout, verification threshold
+├── models.py        # Finding / Decision / TrajectoryStep / AuditEvent
+├── llm.py           # reuse of LiteLLMAIHandler
+├── federation.py    # multi-sub-agent fan-out + merge
+├── benchmark.py     # reproducible scoring harness
+└── tools/
+    ├── base.py      # protocol, registry, MCP descriptors/adapters
+    ├── read_file_context.py
+    ├── find_references.py
+    └── run_static_analysis.py
+tests/unittest/agent_exec/
+├── test_agent_exec.py
+├── test_agent_review_wiring.py
+├── test_mcp_tools.py
+├── test_federation.py
+└── test_benchmark.py
+```
+
+## Configuration
+
+Defaults live in `pr_agent/settings/configuration.toml`:
+
+```toml
+[agent_exec]
+enabled = false
+max_steps = 6
+max_tool_calls = 4
+max_tokens = 20000
+tool_timeout_seconds = 10.0
+verify_confidence_threshold = 0.6
+loop_detection_window = 3
+enforce_tool_whitelist = true
+```
+
+Override per repository in `.pr_agent.toml`, or globally with environment
+variables such as `AGENT_EXEC__ENABLED=true`.
+
+## Documentation
+
+- [Full startup and operations guide (中文)](docs/md/项目启动运行说明.md)
+- [Implementation checklist and resume cross-check (中文)](docs/md/技术实现清单与简历核对.md)
+
+## Credits
+
+ReviewPilot builds on [PR-Agent](https://github.com/qodo-ai/pr-agent) by Qodo.
+Provider integrations, prompting infrastructure, configuration system and CLI
+come from upstream. The agent loop, guardrails, federation and benchmark layers
+are added in `pr_agent/agent_exec/`.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

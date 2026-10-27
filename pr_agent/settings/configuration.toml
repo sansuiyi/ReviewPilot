@@ -6,6 +6,8 @@
 max_webhook_request_body_bytes = 5242880 # maximum request body accepted by webhook servers (5 MiB)
 # models
 model="gpt-5.6"
+# 使用火山方舟（OpenAI 兼容，复用 LiteLLM 逻辑）时，改为下面这种格式：
+# model="volcengine/<你的接入点模型名>"  # 例如 volcengine/doubao-1-5-pro-32k
 fallback_models=["gpt-5.6-terra"]
 #model_reasoning="gpt-5.6-terra" # dedicated reasoning model for self-reflection
 #model_weak="gpt-5.6-luna" # optional, a weaker model to use for some easier tasks
@@ -305,6 +307,19 @@ docs_path = "docs"
 exclude_root_readme = false
 supported_doc_exts = [".md", ".mdx", ".rst"]
 enable_help_text=false
+
+[agent_exec]
+# ReviewPilot multi-step agent loop (pr_agent/agent_exec). Disabled by default so
+# the existing single-shot /review pipeline is unchanged until the agent is
+# explicitly enabled. The budgets below are enforced in server code, not the prompt.
+enabled = false
+max_steps = 6           # maximum review/decide iterations before the loop must stop
+max_tool_calls = 4      # maximum tool executions across a single PR review
+max_tokens = 20000      # reserved token budget for the agent run (informational bound)
+tool_timeout_seconds = 10.0  # per-tool execution timeout
+verify_confidence_threshold = 0.6  # high-risk findings below this confidence trigger verification (Jev)
+loop_detection_window = 3  # force finalize when the last N decision signatures repeat
+enforce_tool_whitelist = true  # refuse tools not in the first-phase whitelist (harness)
 
 [github]
 # The type of deployment to create. Valid values are 'app' or 'user'.

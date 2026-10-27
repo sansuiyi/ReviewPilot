@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -2496,6 +2496,7 @@ dependencies = [
     { name = "html2text" },
     { name = "jinja2" },
     { name = "langfuse" },
+    { name = "langgraph" },
     { name = "litellm" },
     { name = "loguru" },
     { name = "openai" },
@@ -2619,6 +2620,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langchain'" },
     { name = "langchain-openai", marker = "extra == 'langchain'" },
     { name = "langfuse", specifier = "==3.14.5" },
+    { name = "langgraph", specifier = ">=0.2,<2" },
     { name = "litellm", specifier = "==1.104.0" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "mangum", marker = "extra == 'lambda'", specifier = "==0.22.0" },
