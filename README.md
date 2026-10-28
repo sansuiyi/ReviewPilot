@@ -1,6 +1,6 @@
 # ReviewPilot
 
-**A bounded, auditable AI code-review agent — built on top of [PR-Agent](https://github.com/qodo-ai/pr-agent).**
+**A bounded, auditable AI code-review agent — any pull request in, a verified, traceable review out.**
 
 English · [简体中文](README.zh-CN.md)
 
@@ -11,16 +11,22 @@ English · [简体中文](README.zh-CN.md)
 
 ---
 
-## What this is
+## Overview
 
-PR-Agent already ships a strong single-shot review pipeline. ReviewPilot adds a
-**bounded agent loop** on top of it: the model can inspect the diff, call
-read-only tools, verify its own high-risk findings, and only then publish a
-review. Every step is recorded, and every limit is enforced by the harness —
-not by the prompt.
+ReviewPilot is an AI code-review agent for pull requests. Point it at a PR and
+it inspects the diff, calls read-only tools to gather context, verifies its own
+high-risk findings with an independent review pass, and publishes a structured
+review comment. It works on GitHub, GitLab, Bitbucket, Azure DevOps, Gitea,
+Gerrit and plain diffs, from both the CLI and webhook servers.
+
+Reviews run inside a **bounded agent loop** (OODA): at every step the model
+observes the environment and decides the next action, while a server-side
+harness enforces hard limits on steps, tool calls, tokens and timeouts. Every
+step is recorded as a structured, replayable trajectory with audit events.
 
 The loop is **opt-in**. With `[agent_exec].enabled = false` (the default),
-`/review` behaves exactly like upstream PR-Agent.
+`/review` runs the single-shot pipeline; set it to `true` and the full agent
+loop takes over.
 
 ## Highlights
 
@@ -64,7 +70,13 @@ uv sync
 
 # Configure secrets
 cp pr_agent/settings/.secrets_template.toml pr_agent/settings/.secrets.toml
-# fill [openai] key and [github] user_token
+
+# Pick your model, e.g. DeepSeek (any LiteLLM-supported provider works).
+# In pr_agent/settings/.secrets.toml:
+#   [config]
+#   model = "deepseek/deepseek-chat"
+#   [deepseek]
+#   key = "sk-..."   # from https://platform.deepseek.com
 
 # Run a normal review
 PYTHONPATH=. uv run pr-agent --pr_url=https://github.com/owner/repo/pull/1 review
@@ -228,13 +240,6 @@ variables such as `AGENT_EXEC__ENABLED=true`.
 
 - [Full startup and operations guide (中文)](docs/md/项目启动运行说明.md)
 - [Implementation checklist and resume cross-check (中文)](docs/md/技术实现清单与简历核对.md)
-
-## Credits
-
-ReviewPilot builds on [PR-Agent](https://github.com/qodo-ai/pr-agent) by Qodo.
-Provider integrations, prompting infrastructure, configuration system and CLI
-come from upstream. The agent loop, guardrails, federation and benchmark layers
-are added in `pr_agent/agent_exec/`.
 
 ## License
 

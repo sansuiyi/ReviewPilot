@@ -1,6 +1,6 @@
 # ReviewPilot
 
-**一个有界、可审计的 AI 代码评审 Agent —— 构建在 [PR-Agent](https://github.com/qodo-ai/pr-agent) 之上。**
+**一个有界、可审计的 AI 代码评审 Agent —— 输入任意 Pull Request，输出经过复核、全程可追溯的评审结果。**
 
 [English](README.md) · 简体中文
 
@@ -10,11 +10,13 @@
 
 ---
 
-## 这是什么
+## 项目简介
 
-PR-Agent 已经提供了成熟的单次审查管线。ReviewPilot 在此基础上增加了一个**有界 Agent 循环**：模型可以先查看 diff、调用只读工具、复核自己高风险低置信的结论，然后再输出评审结果。每一步都会被记录，每一条限制都由 Harness（服务端代码）强制执行，而不是靠 prompt 自觉。
+ReviewPilot 是一个面向 Pull Request 的 AI 代码评审 Agent。指向一个 PR，它会检查 diff、调用只读工具收集上下文、用独立的复核环节验证自己的高风险结论，最后发布结构化的评审评论。支持 GitHub、GitLab、Bitbucket、Azure DevOps、Gitea、Gerrit 以及纯 diff 输入，可通过 CLI 或 Webhook 服务运行。
 
-该循环是**可选的**。`[agent_exec].enabled = false`（默认值）时，`/review` 的行为与上游 PR-Agent 完全一致。
+评审在一个**有界 Agent 循环**（OODA）中进行：每一步由模型观察环境并决定下一个动作，同时 Harness（服务端代码）对步数、工具调用次数、Token 和超时实施硬性限制。每一步都会记录为结构化、可回放的 Trajectory 与审计事件。
+
+该循环是**可选的**。`[agent_exec].enabled = false`（默认值）时，`/review` 走单次审查管线；设为 `true` 后完整 Agent 循环接管。
 
 ## 能力一览
 
@@ -56,7 +58,13 @@ uv sync
 
 # 配置密钥
 cp pr_agent/settings/.secrets_template.toml pr_agent/settings/.secrets.toml
-# 填写 [openai] key 与 [github] user_token
+
+# 选择模型，例如 DeepSeek（支持任意 LiteLLM 兼容的 provider）。
+# 在 pr_agent/settings/.secrets.toml 中：
+#   [config]
+#   model = "deepseek/deepseek-chat"
+#   [deepseek]
+#   key = "sk-..."   # 从 https://platform.deepseek.com 获取
 
 # 正常审查一个 PR
 PYTHONPATH=. uv run pr-agent --pr_url=https://github.com/owner/repo/pull/1 review
@@ -204,10 +212,6 @@ enforce_tool_whitelist = true
 
 - [完整启动运行说明](docs/md/项目启动运行说明.md)
 - [技术实现清单与简历核对](docs/md/技术实现清单与简历核对.md)
-
-## 致谢
-
-ReviewPilot 基于 Qodo 的 [PR-Agent](https://github.com/qodo-ai/pr-agent) 构建。各平台集成、Prompt 基础设施、配置系统与 CLI 均来自上游；Agent 循环、护栏、多 Sub-agent 与 Benchmark 层新增在 `pr_agent/agent_exec/`。
 
 ## 许可证
 
