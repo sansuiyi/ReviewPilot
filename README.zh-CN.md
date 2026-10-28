@@ -52,6 +52,10 @@ flowchart LR
 
 ## 快速开始
 
+一键运行（Windows）：`.\start.ps1` 会自动检查环境、按需创建虚拟环境与密钥文件，并对示例 diff 跑一次真实 Agent 评审。`.\start.ps1 -Test` 运行单元测试，`.\start.ps1 -CheckOnly` 仅检查环境。也可直接双击 `start.bat`。
+
+手动步骤：
+
 ```bash
 # 需要 Python >= 3.12、uv >= 0.12.10
 uv sync

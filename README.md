@@ -64,6 +64,13 @@ detected, or a finding needs verification.
 
 ## Quick start
 
+One-click (Windows): `.\start.ps1` verifies the environment, creates the venv
+and secrets file if missing, and runs a live agent review on a sample diff.
+Use `.\start.ps1 -Test` for the unit suite, `.\start.ps1 -CheckOnly` for an
+environment check only. Double-clicking `start.bat` works too.
+
+Manual steps:
+
 ```bash
 # Python >= 3.12 and uv >= 0.12.10
 uv sync
