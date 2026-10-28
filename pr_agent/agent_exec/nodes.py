@@ -18,6 +18,8 @@ import json
 import time
 from typing import Any, Dict, List
 
+from loguru import logger
+
 from pr_agent.agent_exec.models import (
     AgentState,
     AuditEvent,
@@ -31,8 +33,6 @@ from pr_agent.agent_exec.models import (
 from pr_agent.agent_exec.policy import AgentPolicy
 from pr_agent.agent_exec.tools.base import ToolRegistry
 
-_AVAILABLE_TOOL_NAMES = {"read_file_context", "find_references", "run_static_analysis"}
-
 _SYSTEM_PROMPT = (
     "You are a code-review agent inspecting a pull request. You may call tools to "
     "gather context before finalizing. Reply with a single JSON object using one "
@@ -44,7 +44,9 @@ _SYSTEM_PROMPT = (
     '"risk_level":"high","confidence":0.5,"evidence":["..."]}]}\n'
     "On finalize, always include the complete list of findings you discovered. "
     "Choose verify only for a finding that is high risk AND low confidence. "
-    "Choose finalize only when no further tool call would change your judgment."
+    "Choose finalize only when no further tool call would change your judgment. "
+    "The pull-request diff itself is NOT included in the conversation: call the "
+    "read_file_context tool first (path may be empty) to inspect the changed files."
 )
 
 
@@ -77,8 +79,10 @@ def _parse_findings(raw: Any) -> List[Finding]:
                 item = {**item, "id": f"finding-{index}"}
             try:
                 findings.append(Finding.model_validate(item))
-            except Exception:
-                # Skip a malformed finding rather than failing the whole step.
+            except Exception as exc:
+                # Skip a malformed finding rather than failing the whole step,
+                # but leave a trace so the loss is diagnosable.
+                logger.warning("dropped malformed finding #{}: {} ({})", index, item.get("title"), exc)
                 continue
     return findings
 
@@ -111,21 +115,27 @@ async def orient_node(state: AgentState, policy: AgentPolicy) -> Dict[str, Any]:
     return {"orientation": orientation, "trajectory": trajectory}
 
 
-async def review_node(state: AgentState, llm: Any, policy: AgentPolicy) -> Dict[str, Any]:
+async def review_node(state: AgentState, llm: Any, registry: ToolRegistry, policy: AgentPolicy) -> Dict[str, Any]:
     """Observe the environment and produce the next routing decision (Decide).
 
     Also extracts findings when the model finalizes, and applies server-side
     guardrails: step/tool budgets, loop detection, and the Jev rule that forces
-    verification for high-risk low-confidence findings.
+    verification for high-risk low-confidence findings. An unknown tool name is
+    not fatal: the tools node refuses it and the refusal is fed back so the
+    model can self-correct on the next iteration (still budget-bounded).
     """
     orientation = state.orientation or "(no orientation)"
+    system = (
+        f"{_SYSTEM_PROMPT}\n\n"
+        f"Available tools: {', '.join(sorted(registry.names()))}. Any other tool name is refused."
+    )
     user = (
         f"{orientation}\n\n"
         f"Findings so far:\n{json.dumps([f.model_dump() for f in state.findings], ensure_ascii=False)}\n"
         f"Tool results so far:\n{json.dumps([r.model_dump() for r in state.tool_results], ensure_ascii=False)}\n"
         "Decide the next action."
     )
-    content, _ = await llm.complete(system=_SYSTEM_PROMPT, user=user)
+    content, _ = await llm.complete(system=system, user=user)
 
     decision = Decision(action="finalize", reasoning="unable to parse decision, finalizing")
     new_findings: List[Finding] = []
@@ -146,8 +156,9 @@ async def review_node(state: AgentState, llm: Any, policy: AgentPolicy) -> Dict[
             decision = Decision(action="finalize", reasoning="step budget exhausted")
         elif len(state.tool_results) >= policy.max_tool_calls:
             decision = Decision(action="finalize", reasoning="tool-call budget exhausted")
-        elif decision.tool_name not in _AVAILABLE_TOOL_NAMES:
-            decision = Decision(action="finalize", reasoning=f"unknown tool {decision.tool_name}")
+        # An unregistered tool is NOT finalized here: the tools node refuses it
+        # with the available names and the loop gives the model a chance to
+        # self-correct, bounded by the budgets above and loop detection.
 
     # Loop detection: force finalize when the last N decisions repeat.
     if decision.action != "finalize":
@@ -156,11 +167,12 @@ async def review_node(state: AgentState, llm: Any, policy: AgentPolicy) -> Dict[
         if len(window) >= policy.loop_detection_window and len(set(window)) == 1:
             decision = Decision(action="finalize", reasoning="loop detected, forcing finalize")
 
-    # Jev: a high-risk low-confidence unverified finding must be verified first.
+    # Jev: a high-risk (or critical) low-confidence unverified finding must be
+    # verified first.
     merged_findings = list(state.findings) + new_findings
     if decision.action == "finalize":
         for finding in merged_findings:
-            high_risk = finding.risk_level == RiskLevel.HIGH
+            high_risk = finding.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
             low_confidence = finding.confidence < policy.verify_confidence_threshold
             if high_risk and low_confidence and finding.verified is None:
                 decision = Decision(
@@ -176,7 +188,7 @@ async def review_node(state: AgentState, llm: Any, policy: AgentPolicy) -> Dict[
             step=state.step,
             node="review",
             summary=f"decision={decision.action}",
-            tokens_estimate=len(_SYSTEM_PROMPT) + len(user),
+            tokens_estimate=len(system) + len(user),
         )
     ]
 
@@ -212,7 +224,10 @@ async def tools_node(state: AgentState, registry: ToolRegistry, policy: AgentPol
             tool_name=tool_name,
             success=False,
             status=ToolStatus.UNSUPPORTED,
-            error="tool not registered",
+            error=(
+                "tool not registered; "
+                f"available tools: {', '.join(sorted(registry.names()))}"
+            ),
         )
         outcome = "refused"
     else:

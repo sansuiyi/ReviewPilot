@@ -10,7 +10,7 @@ import time
 from enum import Enum
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ToolStatus(str, Enum):
@@ -39,6 +39,7 @@ class RiskLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    CRITICAL = "critical"
 
 
 class Finding(BaseModel):
@@ -55,6 +56,14 @@ class Finding(BaseModel):
     # True once a separate verification pass has confirmed or refuted the finding.
     verified: Optional[bool] = None
     verification_note: Optional[str] = None
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def _normalize_risk_level(cls, value: Any) -> Any:
+        # Models emit "Critical"/"HIGH" as often as "critical"; accept any case.
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
 
 class Decision(BaseModel):

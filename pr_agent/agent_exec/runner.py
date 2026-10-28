@@ -32,7 +32,8 @@ class ReviewAgentRunner:
     """Runs the bounded tool-use review loop over a PR diff."""
 
     def __init__(self, ai_handler_factory=None) -> None:
-        self._llm = AgentLLM(ai_handler_factory)
+        # AgentLLM defaults to LiteLLMAIHandler; None here must not override it.
+        self._llm = AgentLLM() if ai_handler_factory is None else AgentLLM(ai_handler_factory)
         self._policy = load_policy()
 
     async def run(self, diff_files: List[Any], findings: Optional[List[Any]] = None) -> AgentState:

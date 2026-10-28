@@ -63,6 +63,19 @@ def _decision_json(action, **kwargs):
     return json.dumps(payload)
 
 
+def test_finding_accepts_critical_and_mixed_case_risk_level():
+    from pr_agent.agent_exec.models import Finding, RiskLevel
+
+    # Real models emit "critical" (and arbitrary casing); they must survive
+    # parsing instead of being silently dropped.
+    f1 = Finding.model_validate({"id": "f1", "title": "t", "risk_level": "critical"})
+    assert f1.risk_level is RiskLevel.CRITICAL
+    f2 = Finding.model_validate({"id": "f2", "title": "t", "risk_level": "HIGH"})
+    assert f2.risk_level is RiskLevel.HIGH
+    f3 = Finding.model_validate({"id": "f3", "title": "t", "risk_level": " Critical "})
+    assert f3.risk_level is RiskLevel.CRITICAL
+
+
 @pytest.mark.asyncio
 async def test_read_file_context_does_not_treat_deleted_lines_as_content():
     tool = ReadFileContextTool([_py_file("@@ -1,2 +1,2 @@\n-old\n+new\n")])
@@ -192,6 +205,33 @@ async def test_jev_forces_verify_for_high_risk_low_confidence():
 
 
 @pytest.mark.asyncio
+async def test_jev_forces_verify_for_critical_risk_low_confidence():
+    from pr_agent.agent_exec.runner import ReviewAgentRunner
+
+    critical_risk = {
+        "id": "f1",
+        "file_path": "a.py",
+        "line_number": 1,
+        "title": "remote code execution",
+        "risk_level": "critical",
+        "confidence": 0.4,
+    }
+    responses = [
+        _decision_json("finalize", findings=[critical_risk]),
+        '{"verified": true, "note": "confirmed"}',
+        _decision_json("finalize"),
+    ]
+    factory = MockHandlerFactory(responses)
+    runner = ReviewAgentRunner(ai_handler_factory=factory)
+
+    state = await runner.run([_py_file("+eval(user_input)\n")])
+
+    # Critical findings trigger Jev just like high-risk ones.
+    assert state.findings[0].risk_level.value == "critical"
+    assert state.findings[0].verified is True
+
+
+@pytest.mark.asyncio
 async def test_loop_detection_forces_finalize():
     from pr_agent.agent_exec.runner import ReviewAgentRunner
 
@@ -209,16 +249,25 @@ async def test_loop_detection_forces_finalize():
 
 
 @pytest.mark.asyncio
-async def test_harness_refuses_unknown_tool():
+async def test_harness_refuses_unknown_tool_and_lets_model_retry():
     from pr_agent.agent_exec.runner import ReviewAgentRunner
 
-    factory = MockHandlerFactory([_decision_json("tools", tool_name="delete_all_files")])
+    factory = MockHandlerFactory(
+        [
+            _decision_json("tools", tool_name="delete_all_files"),
+            _decision_json("finalize"),
+        ]
+    )
     runner = ReviewAgentRunner(ai_handler_factory=factory)
 
     state = await runner.run([_py_file("+x = 1\n")])
 
-    # The unknown tool is refused by the whitelist before execution.
-    assert state.tool_results == []
+    # The unknown tool is refused before execution; the refusal lists the
+    # available names and is fed back so the model can self-correct.
+    assert len(state.tool_results) == 1
+    refusal = state.tool_results[0]
+    assert refusal.status is ToolStatus.UNSUPPORTED
+    assert "read_file_context" in refusal.error
     assert state.final_answer is not None
 
 
