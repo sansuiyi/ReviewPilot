@@ -1,4 +1,4 @@
-﻿"""Data models for the ReviewPilot agent execution loop.
+"""Data models for the ReviewPilot agent execution loop.
 
 All models are Pydantic v2 (``ConfigDict(extra="forbid")``) to stay consistent
 with the rest of the repository. ``ToolResult`` is the single contract returned

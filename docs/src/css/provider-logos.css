@@ -75,7 +75,7 @@
 .pra-side-gitea { --pra-side-logo: url('/img/logos/gitea.svg'); }
 .pra-side-terminal { --pra-side-logo: url('/img/logos/terminal.svg'); }
 
-/* Installation index: the list of ways to run PR-Agent, as a grid of cards. */
+/* Installation index: the list of ways to run ReviewPilot, as a grid of cards. */
 .pra-provider-grid > ul {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));

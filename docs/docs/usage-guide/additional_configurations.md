@@ -128,7 +128,7 @@ This will set the response language globally for all the commands to Italian.
 [//]: # (## Working with large PRs)
 
 [//]: # ()
-[//]: # (The default mode of CodiumAI is to have a single call per tool, using GPT-4, which has a token limit of 8000 tokens.)
+[//]: # (The default mode of the agent is to have a single call per tool, using GPT-4, which has a token limit of 8000 tokens.)
 
 [//]: # (This mode provides a very good speed-quality-cost tradeoff, and can handle most PRs successfully.)
 
@@ -448,7 +448,7 @@ repo_context_files = ["AGENTS.md", "CLAUDE.md", "docs/conventions.md"]
 ```
 
 :::note[Which branch the files are read from]
-By default (`repo_context_from_default_branch = true`), instruction files are read from the repository's **default branch** — a single trusted source — so neither the PR nor its target branch can alter the guidance used to review it. This matches how Qodo Merge reads these files.
+By default (`repo_context_from_default_branch = true`), instruction files are read from the repository's **default branch** — a single trusted source — so neither the PR nor its target branch can alter the guidance used to review it.
 
 Set `repo_context_from_default_branch = false` to instead read from the PR's **target (base) branch**. This respects branch-specific instructions (for example a release branch, or a stacked PR that carries its own `AGENTS.md`), at the cost of trusting whoever can write to that target branch. Even then, files are never read from the PR's own head.
 

@@ -1,4 +1,4 @@
-﻿"""Thin wrapper over the existing AI handler used by the ReviewPilot agent.
+"""Thin wrapper over the existing AI handler used by the ReviewPilot agent.
 
 Reuses ``LiteLLMAIHandler`` (the repository default) via the same factory
 pattern as ``PRAgent``, and reads the model name from ``config.model`` rather

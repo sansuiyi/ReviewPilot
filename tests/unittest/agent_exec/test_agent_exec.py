@@ -1,4 +1,4 @@
-﻿"""Unit tests for the ReviewPilot agent loop (pr_agent/agent_exec).
+"""Unit tests for the ReviewPilot agent loop (pr_agent/agent_exec).
 
 These tests use a mock AI handler and mock ``FilePatchInfo`` objects, so no real
 API key or network is required. They verify the core property of the upgrade:

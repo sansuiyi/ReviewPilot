@@ -1,11 +1,11 @@
 # Changelog
 
 **Release notes now live on GitHub.** The authoritative, per-release changelog is the
-[Releases page](https://github.com/The-PR-Agent/pr-agent/releases), which is generated from the
+[Releases page](https://github.com/sansuiyi/ReviewPilot/releases), which is generated from the
 merged pull requests of each release. This file is no longer updated per release.
 
 To see what changed between two versions, use the compare view — for example
-[`v0.40.0...v0.41.0`](https://github.com/The-PR-Agent/pr-agent/compare/v0.40.0...v0.41.0).
+[`v0.40.0...v0.41.0`](https://github.com/sansuiyi/ReviewPilot/compare/v0.40.0...v0.41.0).
 
 ---
 

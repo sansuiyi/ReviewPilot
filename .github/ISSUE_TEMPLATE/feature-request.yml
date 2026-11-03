@@ -1,5 +1,5 @@
 name: "\U0001F4A1 Feature request"
-description: Submit a proposal/request for a new PR-Agent feature
+description: Submit a proposal/request for a new ReviewPilot feature
 labels: ["feature"]
 body:
   - type: textarea

@@ -138,7 +138,7 @@ SHARED_SECRET=$(python -c "import secrets; print(secrets.token_hex(10))")
 4. Clone this repository:
 
 ```bash
-git clone https://github.com/the-pr-agent/pr-agent.git
+git clone https://github.com/sansuiyi/ReviewPilot.git
 ```
 
 5. Prepare variables and secrets. Skip this step if you plan on setting these as environment variables when running the agent:

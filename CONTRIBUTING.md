@@ -1,6 +1,6 @@
-# Contributing to PR-Agent
+# Contributing to ReviewPilot
 
-Thank you for your interest in contributing to the PR-Agent project!
+Thank you for your interest in contributing to the ReviewPilot project!
 
 ## Getting Started
 
@@ -43,6 +43,6 @@ Thank you for your interest in contributing to the PR-Agent project!
 
 ## Questions or Need Help?
 
-- Ask questions or start a discussion in [GitHub Discussions](https://github.com/the-pr-agent/pr-agent/discussions)
+- Ask questions or start a discussion in [GitHub Discussions](https://github.com/sansuiyi/ReviewPilot/discussions)
 - Check the [documentation](https://docs.pr-agent.ai/) for detailed information
-- Report bugs or request features through [GitHub Issues](https://github.com/the-pr-agent/pr-agent/issues)
+- Report bugs or request features through [GitHub Issues](https://github.com/sansuiyi/ReviewPilot/issues)

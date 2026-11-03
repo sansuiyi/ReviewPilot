@@ -1,10 +1,10 @@
 {
-  "name": "CodiumAI PR-Agent",
-  "description": "CodiumAI PR-Agent",
+  "name": "ReviewPilot",
+  "description": "ReviewPilot",
   "key": "app_key",
   "vendor": {
-    "name": "CodiumAI",
-    "url": "https://codium.ai"
+    "name": "ReviewPilot",
+    "url": "https://github.com/sansuiyi/ReviewPilot"
   },
   "authentication": {
     "type": "jwt"
@@ -32,7 +32,7 @@
     ]
   },
   "links": {
-    "privacy": "https://qodo.ai/privacy-policy",
-    "terms": "https://qodo.ai/terms"
+    "privacy": "https://github.com/sansuiyi/ReviewPilot",
+    "terms": "https://github.com/sansuiyi/ReviewPilot"
   }
 }

@@ -30,19 +30,17 @@ export default function Maintainers() {
   return (
     <Layout
       title="Maintainers"
-      description="The people who maintain PR-Agent, the open-source AI agent for pull requests.">
+      description="The people who maintain ReviewPilot, the open-source AI agent for pull requests.">
       <main className={styles.page}>
         <header className={styles.header}>
           <h1 className={styles.title}>Maintainers</h1>
           <p className={styles.lede}>
-            PR-Agent was started at <Link to="https://www.qodo.ai/">Qodo</Link> in July 2023. In April
-            2026 Qodo donated it to the open-source community, and it now lives in the{' '}
-            <Link to="https://github.com/the-pr-agent">PR-Agent organization on GitHub</Link>, maintained
-            by the people below.
+            ReviewPilot is an open-source AI agent for pull requests, maintained by the people
+            below.
           </p>
           <p className={styles.join}>
             The project is open to new contributors and maintainers.{' '}
-            <Link to="https://github.com/the-pr-agent/pr-agent/blob/main/CONTRIBUTING.md">
+            <Link to="https://github.com/sansuiyi/ReviewPilot/blob/main/CONTRIBUTING.md">
               Read the contributing guide
             </Link>
           </p>

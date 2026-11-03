@@ -5,10 +5,7 @@
  * Set `name` to the login when the maintainer has no public display name.
  */
 export const maintainers = [
-  {login: 'naorpeled', name: 'Naor Peled', role: 'Lead Maintainer'},
-  {login: 'ofir-frd', name: 'ofir-frd', role: 'Maintainer'},
-  {login: 'IsmaelMartinez', name: 'IsmaelMartinez', role: 'Maintainer'},
-  {login: 'DanaFineTLV', name: 'Dana Fine', role: 'Community Manager'},
+  {login: 'sansuiyi', name: 'sansuiyi', role: 'Maintainer'},
 ];
 
 /** Return the GitHub avatar URL for `login` at `size` pixels. */

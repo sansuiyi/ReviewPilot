@@ -1,4 +1,4 @@
-﻿"""Execution policy for the ReviewPilot agent loop.
+"""Execution policy for the ReviewPilot agent loop.
 
 The harness reads these bounds from ``[agent_exec]`` settings (falling back to
 conservative defaults) and enforces them in server code, independent of the

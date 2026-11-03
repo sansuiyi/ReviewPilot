@@ -103,7 +103,7 @@ def show_relevant_configurations(relevant_section: str) -> str:
     markdown_text += "\n<hr>\n<details> <summary><strong>🛠️ Relevant configurations:</strong></summary> \n\n"
     markdown_text += (
         "<br>These are the relevant [configurations]"
-        "(https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/configuration.toml)"
+        "(https://github.com/sansuiyi/ReviewPilot/blob/main/pr_agent/settings/configuration.toml)"
         " for this tool:\n\n"
     )
     markdown_text += "**[config**]\n```yaml\n\n"

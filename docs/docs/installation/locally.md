@@ -60,7 +60,7 @@ To invoke a tool (for example `review`), you can run PR-Agent directly from the 
     ```
 
 
-For other git providers, update `CONFIG__GIT_PROVIDER` accordingly and check the [`pr_agent/settings/.secrets_template.toml`](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/.secrets_template.toml) file for environment variables expected names and values.
+For other git providers, update `CONFIG__GIT_PROVIDER` accordingly and check the [`pr_agent/settings/.secrets_template.toml`](https://github.com/sansuiyi/ReviewPilot/blob/main/pr_agent/settings/.secrets_template.toml) file for environment variables expected names and values.
 
 ### Utilizing environment variables
 
@@ -121,7 +121,7 @@ def main():
     provider = "github" # github/gitlab/bitbucket/azure_devops
     user_token = "..."  #  user token
     openai_key = "..."  # OpenAI key
-    pr_url = "..."      # PR URL, for example 'https://github.com/the-pr-agent/pr-agent/pull/809'
+    pr_url = "..."      # PR URL, for example 'https://github.com/sansuiyi/ReviewPilot/pull/809'
     command = "/review" # Command to run (e.g. '/review', '/describe', '/ask="What is the purpose of this PR?"', ...)
 
     # Setting the configurations
@@ -152,7 +152,7 @@ This does not change how interactive PR comments are parsed.
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/the-pr-agent/pr-agent.git
+git clone https://github.com/sansuiyi/ReviewPilot.git
 ```
 
 2. Navigate to the `/pr-agent` folder and install dependencies with [uv](https://docs.astral.sh/uv/) (creates a `.venv` from `uv.lock`):

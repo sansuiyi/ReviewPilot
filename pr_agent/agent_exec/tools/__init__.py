@@ -1,4 +1,4 @@
-﻿"""Read-only tools available to the ReviewPilot agent in phase one."""
+"""Read-only tools available to the ReviewPilot agent in phase one."""
 
 from pr_agent.agent_exec.tools.base import (
     MCPToolAdapter,

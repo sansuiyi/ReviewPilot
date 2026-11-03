@@ -1,4 +1,4 @@
-﻿"""ReviewPilot agent execution package.
+"""ReviewPilot agent execution package.
 
 This package hosts the multi-step code-review agent that upgrades PR-Agent's
 single-shot review pipeline into a bounded tool-use loop. It is kept separate

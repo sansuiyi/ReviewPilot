@@ -23,8 +23,6 @@ However, PR-Agent has built-in safeguards to ensure the developer remains in the
     - Highlight potential bugs or oversights
     - Enhance code quality and promote best practices
 
-Read more about this issue in our [blog](https://www.qodo.ai/blog/understanding-the-challenges-and-pain-points-of-the-pull-request-cycle/)
-
 </details>
 
 ___

@@ -1,4 +1,4 @@
-﻿"""Deterministic lightweight static checks for changed files.
+"""Deterministic lightweight static checks for changed files.
 
 First phase only: a Python AST syntax check plus a small set of explicit,
 low-false-positive pattern rules. Each result carries a rule id, file path, line

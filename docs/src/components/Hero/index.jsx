@@ -2,7 +2,7 @@ import React, {useRef, useState} from 'react';
 import Link from '@docusaurus/Link';
 import styles from './styles.module.css';
 
-// The PR-Agent mark (the pull-request glyph from the favicon).
+// The ReviewPilot mark (the pull-request glyph from the favicon).
 function Mark({className}) {
   return (
     <svg className={className} viewBox="0 0 16 16" aria-hidden="true">
@@ -129,7 +129,7 @@ function Thread() {
   };
 
   return (
-    <figure className={styles.thread} aria-label="Example: running a PR-Agent command on a pull request">
+    <figure className={styles.thread} aria-label="Example: running a ReviewPilot command on a pull request">
       <div className={styles.threadHead}>
         <span className={styles.prTitle}>feat: retry failed webhook deliveries</span>
         <span className={styles.prNumber}>#482</span>
@@ -192,16 +192,16 @@ export default function Hero() {
   return (
     <header className={styles.hero}>
       <div className={styles.intro}>
-        <h1 className={styles.title}>PR-Agent</h1>
+        <h1 className={styles.title}>ReviewPilot</h1>
         <p className={styles.lede}>
           An open-source AI agent that describes, reviews and improves pull requests. Run it from a PR
           comment, a webhook, your CI or the terminal.
         </p>
         <div className={styles.actions}>
           <Link className={styles.primary} to="/installation/">
-            Install PR-Agent
+            Install ReviewPilot
           </Link>
-          <Link className={styles.secondary} to="https://github.com/the-pr-agent/pr-agent">
+          <Link className={styles.secondary} to="https://github.com/sansuiyi/ReviewPilot">
             View on GitHub
           </Link>
         </div>

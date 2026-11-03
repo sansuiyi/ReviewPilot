@@ -1,4 +1,4 @@
-﻿"""Local text-level reference search over the PR's loaded files.
+"""Local text-level reference search over the PR's loaded files.
 
 First phase only: exact text search for identifiers, function or class names
 across the files already loaded into the run. It deliberately does not claim

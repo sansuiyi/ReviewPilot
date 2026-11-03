@@ -63,7 +63,7 @@ def build_graph(llm: Any, registry: ToolRegistry, policy: AgentPolicy):
     async def _review(state: AgentGraphState) -> Dict[str, Any]:
         from pr_agent.agent_exec.models import AgentState
 
-        return await review_node(AgentState(**state), llm, policy)
+        return await review_node(AgentState(**state), llm, registry, policy)
 
     async def _tools(state: AgentGraphState) -> Dict[str, Any]:
         from pr_agent.agent_exec.models import AgentState

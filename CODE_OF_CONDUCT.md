@@ -35,7 +35,7 @@ individual is representing the project or its community.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by
 contacting a project maintainer privately — the current maintainers are listed at
-[github.com/orgs/The-PR-Agent/people](https://github.com/orgs/The-PR-Agent/people). All
+[github.com/sansuiyi](https://github.com/sansuiyi). All
 complaints will be reviewed and investigated and will result in a response that is deemed
 necessary and appropriate to the circumstances. Maintainers are obligated to maintain
 confidentiality with regard to the reporter of an incident. If the report concerns a

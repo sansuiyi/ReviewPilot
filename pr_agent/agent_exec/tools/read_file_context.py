@@ -1,4 +1,4 @@
-﻿"""Read the changed-file context of a PR diff.
+"""Read the changed-file context of a PR diff.
 
 Reuses the existing GitProvider ``get_diff_files`` result rather than inventing
 a second data path. It returns the changed fragments with line numbers and, when

@@ -1,6 +1,5 @@
-# NOTE: This file is consumed by Qodo's "free for open source" agent
-# (the `qodo-free-for-open-source-projects` bot) — a separate, hosted, closed-source
-# service. It is NOT read by the open-source pr-agent in this repository; some keys
+# NOTE: This file is consumed by a hosted review bot (a separate, closed-source
+# service). It is NOT read by the open-source agent in this repository; some keys
 # below (e.g. the [review_agent] section) only exist in that hosted agent.
 
 [pr_reviewer]

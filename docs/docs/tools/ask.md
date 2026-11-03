@@ -64,8 +64,6 @@ To get a direct link to an image, we recommend using the following scheme:
 
 <img src="/img/ask_images5.png" alt="Ask image5" width="512" />
 
-See a full video tutorial [here](https://codium.ai/images/pr_agent/ask_image_video.mov)
-
 ## Configuration options
 
 <details open>

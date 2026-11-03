@@ -1,4 +1,4 @@
-﻿"""Independent entry point for the ReviewPilot agent loop.
+"""Independent entry point for the ReviewPilot agent loop.
 
 The runner builds the tool registry from already-loaded PR diff files, assembles
 the LangGraph, and invokes it. It stays separate from ``PRReviewer`` so the

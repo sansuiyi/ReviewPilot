@@ -7,15 +7,14 @@ name = "pr-agent"
 version = "0.47.0"
 
 authors = [
-  { name = "QodoAI", email = "ofir.f@qodo.ai" },
+  { name = "ReviewPilot Maintainers" },
 ]
 
 maintainers = [
-  { name = "Naor Peled", email = "me@naor.dev" },
-  { name = "Ofir Friedman", email = "ofir.f@qodo.ai" },
+  { name = "ReviewPilot Maintainers" },
 ]
 
-description = "PR-Agent aims to help efficiently review and handle pull requests, by providing AI feedback and suggestions."
+description = "ReviewPilot helps efficiently review and handle pull requests, by providing AI feedback and suggestions."
 readme = "README.md"
 requires-python = ">=3.12"
 keywords = ["AI", "Agents", "Pull Request", "Automation", "Code Review"]
@@ -76,10 +75,10 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/the-pr-agent/pr-agent"
+"Homepage" = "https://github.com/sansuiyi/ReviewPilot"
 "Documentation" = "https://docs.pr-agent.ai/"
-"Repository" = "https://github.com/the-pr-agent/pr-agent"
-"Issues" = "https://github.com/the-pr-agent/pr-agent/issues"
+"Repository" = "https://github.com/sansuiyi/ReviewPilot"
+"Issues" = "https://github.com/sansuiyi/ReviewPilot/issues"
 
 [tool.setuptools]
 include-package-data = true
